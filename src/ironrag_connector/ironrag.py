@@ -126,6 +126,7 @@ class IronRagClient:
         mime_type: str,
         title: str | None,
         idempotency_key: str,
+        document_hint: str | None = None,
     ) -> dict[str, Any]:
         files = {"file": (file_name, file_bytes, mime_type)}
         data: dict[str, Any] = {
@@ -135,6 +136,8 @@ class IronRagClient:
         }
         if title:
             data["title"] = title
+        if document_hint is not None:
+            data["document_hint"] = document_hint
         response = await self._client.post(
             "/v1/content/documents/upload", data=data, files=files
         )
@@ -173,12 +176,15 @@ class IronRagClient:
         file_name: str,
         mime_type: str,
         idempotency_key: str,
+        document_hint: str | None = None,
     ) -> dict[str, Any] | None:
         """Replace document bytes. Returns ``None`` if IronRAG reports
         the document no longer exists (404/410) — caller must invalidate
         its cursor and retry as upload."""
         files = {"file": (file_name, file_bytes, mime_type)}
         data = {"idempotency_key": idempotency_key}
+        if document_hint is not None:
+            data["document_hint"] = document_hint
         response = await self._client.post(
             f"/v1/content/documents/{document_id}/replace", data=data, files=files
         )

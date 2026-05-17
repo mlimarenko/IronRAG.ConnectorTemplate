@@ -71,6 +71,13 @@ class SourceItem:
     mime_type: str
     file_name: str
     title: str | None = None
+    document_hint: str | None = None
+    """Free-form user-facing label IronRAG surfaces to MCP agents in citations.
+
+    This is not required to be a URL. If omitted, IronRAG falls back to
+    ``source_uri`` or ``document.title``.
+    """
+
     idempotency_key: str | None = None
     """Override the per-call idempotency key.
 

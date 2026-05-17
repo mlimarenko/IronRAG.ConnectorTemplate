@@ -20,6 +20,7 @@ from ironrag_connector.routing import (
     Router,
     RoutingConfig,
 )
+from ironrag_connector.source import SourceItem, SourceItemRef
 from ironrag_connector.state import StateStore
 
 WS = UUID("00000000-0000-0000-0000-000000000099")
@@ -50,6 +51,7 @@ class FakeIronRag:
         mime_type: str,
         title: str | None,
         idempotency_key: str,
+        document_hint: str | None = None,
     ) -> dict[str, Any]:
         self.uploads.append(
             {
@@ -58,6 +60,7 @@ class FakeIronRag:
                 "size": len(file_bytes),
                 "idempotency_key": idempotency_key,
                 "mime_type": mime_type,
+                "document_hint": document_hint,
             }
         )
         if self.duplicate_for_key == external_key:
@@ -83,12 +86,14 @@ class FakeIronRag:
         file_name: str,
         mime_type: str,
         idempotency_key: str,
+        document_hint: str | None = None,
     ) -> dict[str, Any]:
         self.replaces.append(
             {
                 "document_id": document_id,
                 "size": len(file_bytes),
                 "idempotency_key": idempotency_key,
+                "document_hint": document_hint,
             }
         )
         return {"document": {"id": document_id}}
@@ -146,6 +151,76 @@ async def test_create_new_item(tmp_path: Path) -> None:
     assert out.action == "created"
     assert out.ironrag_document_id == "doc-100"
     assert state.get("page", "1").change_token == "t1"
+
+
+@pytest.mark.asyncio
+async def test_document_hint_forwards_on_upload(tmp_path: Path) -> None:
+    adapter = EchoAdapter({})
+    state = _state(tmp_path)
+    ironrag = FakeIronRag()
+    orchestrator = Orchestrator(
+        adapter=adapter,
+        ironrag=ironrag,  # type: ignore[arg-type]
+        router=Router(_routing()),
+        state=state,
+        policies=_policies(),
+    )
+    item = SourceItem(
+        ref=SourceItemRef(
+            item_id="hinted",
+            kind="page",
+            external_key="echo:page:hinted",
+            change_token="t1",
+        ),
+        payload=b"hello",
+        mime_type="text/markdown",
+        file_name="hinted.md",
+        title="Hinted",
+        document_hint="https://docs.example/hinted",
+    )
+    route = Router(_routing()).resolve(item.ref)
+
+    out = await orchestrator.push_item(item, route, PushPolicy())
+
+    assert out.action == "created"
+    assert ironrag.uploads[0]["document_hint"] == "https://docs.example/hinted"
+
+
+@pytest.mark.asyncio
+async def test_document_hint_forwards_on_replace(tmp_path: Path) -> None:
+    adapter = EchoAdapter({})
+    state = _state(tmp_path)
+    ironrag = FakeIronRag()
+    ironrag.documents[(LIB, "echo:page:hinted")] = {
+        "id": "doc-pre",
+        "externalKey": "echo:page:hinted",
+    }
+    orchestrator = Orchestrator(
+        adapter=adapter,
+        ironrag=ironrag,  # type: ignore[arg-type]
+        router=Router(_routing()),
+        state=state,
+        policies=_policies(),
+    )
+    item = SourceItem(
+        ref=SourceItemRef(
+            item_id="hinted",
+            kind="page",
+            external_key="echo:page:hinted",
+            change_token="t2",
+        ),
+        payload=b"hello again",
+        mime_type="text/markdown",
+        file_name="hinted.md",
+        title="Hinted",
+        document_hint="Canonical page label",
+    )
+    route = Router(_routing()).resolve(item.ref)
+
+    out = await orchestrator.push_item(item, route, PushPolicy())
+
+    assert out.action == "replaced"
+    assert ironrag.replaces[0]["document_hint"] == "Canonical page label"
 
 
 @pytest.mark.asyncio

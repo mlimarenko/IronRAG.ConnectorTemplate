@@ -54,6 +54,13 @@ The adapter owns:
   return from `ref.routing_facts` becomes a valid match key in
   `routing.yaml`.
 
+Adapters use `external_key` as the technical sync identity: it must stay
+stable so the connector can find, replace, and reap the right IronRAG
+document. A `SourceItem` may also set `document_hint` to a canonical URL
+or any other user-facing label that IronRAG can surface to MCP agents in
+citations; it is separate from `external_key` and does not participate
+in sync identity.
+
 ## File map
 
 ```

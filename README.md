@@ -36,6 +36,14 @@ uv run pytest
 
 Then replace [`examples/echo_connector/`](examples/echo_connector/) with your adapter package, subclass `BaseConnectorSettings` for vendor credentials, and hand the adapter to `build_app`.
 
+## The contract
+
+Adapters use `external_key` as the technical sync identity: it must stay stable
+so the connector can find, replace, and reap the right IronRAG document. A
+`SourceItem` may also set `document_hint` to a canonical URL or any other
+user-facing label that IronRAG can surface to MCP agents in citations; it is
+separate from `external_key` and does not participate in sync identity.
+
 ## Docs
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — item lifecycle, failure modes, design rationale.

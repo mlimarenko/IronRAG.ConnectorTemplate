@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.0.2 — 2026-05-17
+
+- Added `SourceItem.document_hint`, a user-facing citation label that
+  adapters can set independently from the technical `external_key`.
+- Forward `document_hint` through IronRAG upload and replace multipart
+  requests.
+- Bumped the package version to 0.0.2.
+
 ## 0.0.1 — 2026-05-17
 
 Initial release of the IronRAG connector framework.

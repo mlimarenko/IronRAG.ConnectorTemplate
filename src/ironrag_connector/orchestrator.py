@@ -265,6 +265,7 @@ class Orchestrator:
                     file_name=item.file_name,
                     mime_type=item.mime_type,
                     title=item.title,
+                    document_hint=item.document_hint,
                     idempotency_key=upload_key,
                 )
             except IronRagError as exc:
@@ -345,6 +346,7 @@ class Orchestrator:
             file_name=item.file_name,
             mime_type=item.mime_type,
             idempotency_key=replace_key,
+            document_hint=item.document_hint,
         )
         if result is None:
             # Cursor pointed at a doc IronRAG no longer has (manual delete,
@@ -363,6 +365,7 @@ class Orchestrator:
                 file_name=item.file_name,
                 mime_type=item.mime_type,
                 title=item.title,
+                document_hint=item.document_hint,
                 idempotency_key=upload_key,
             )
             doc = upload_result.get("document") or upload_result
