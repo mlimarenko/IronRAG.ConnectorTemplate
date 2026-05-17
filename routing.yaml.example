@@ -1,0 +1,53 @@
+# Source-item → IronRAG (workspace, library) routing.
+#
+# The connector treats `match` as an arbitrary fact bag. Whatever your
+# SourceAdapter returns from routing_facts(ref) is matched against rules
+# here using exact equality (lists check membership, strings are case-
+# sensitive). Order matters: the first rule whose match block fully holds
+# is applied; if none holds, `default` is used; if `default` is missing
+# and no rule matches, the item is recorded as `unrouted` and skipped.
+#
+# Policies override the global DEFAULT_POLICY_* env vars per kind.
+
+default:
+  workspace: 00000000-0000-0000-0000-000000000000
+  library:   00000000-0000-0000-0000-000000000000
+
+rules:
+  - description: "Engineering shelf goes to engineering library"
+    match:
+      shelf: engineering
+    target:
+      library: 00000000-0000-0000-0000-000000000001
+
+  - description: "Release notes book"
+    match:
+      book: release-notes
+    target:
+      library: 00000000-0000-0000-0000-000000000002
+
+  - description: "Tagged 'archive' anywhere"
+    match:
+      tag: archive
+    target:
+      library: 00000000-0000-0000-0000-000000000003
+
+  - description: "Cross-workspace example"
+    match:
+      space: partner-portal
+    target:
+      workspace: 00000000-0000-0000-0000-000000000099
+      library:   00000000-0000-0000-0000-000000000004
+
+# Optional per-kind push policies. Keys are the `kind` values your adapter
+# emits on SourceItemRef.kind. Anything omitted falls back to the env-var
+# defaults.
+policies:
+  page:
+    on_missing: delete
+  image:
+    # Images are content-addressed; if a page stops referencing one we keep
+    # the IronRAG document around for any other page that still points at it.
+    on_missing: ignore
+  attachment:
+    on_missing: delete
