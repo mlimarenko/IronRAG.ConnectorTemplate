@@ -23,6 +23,7 @@ Dispatch flow per item
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -73,15 +74,26 @@ class OrchestrationOutcome:
 
 
 def _default_idempotency_key(connector: str, item: SourceItem, op: str) -> str:
-    """Compose an idempotency key scoped to the IronRAG mutation type.
+    """Compose an idempotency key scoped to the mutation type AND payload.
 
     IronRAG rejects 409 ``idempotency_conflict`` if the same key reaches
-    two different mutation operations (upload vs replace). The op suffix
-    keeps retries of the same logical operation idempotent without
-    cross-operation collisions.
+    the server twice carrying a *different* payload. Keying on a content
+    hash of the bytes (rather than the source ``change_token``) makes the
+    key identify the request precisely:
+
+    * Identical bytes retried after a partial failure (timeout, proxy 502
+      after the server already applied the write) reuse the same key and
+      dedupe into a single mutation.
+    * A payload that re-renders differently for the same logical version
+      (e.g. Confluence ``export_view`` HTML is not byte-stable across
+      fetches) gets a fresh key and applies cleanly instead of colliding
+      with the stuck prior attempt.
+
+    The ``op`` suffix keeps upload and replace in separate key spaces so a
+    create and a later replace of the same item never collide.
     """
-    token = item.ref.change_token or "no-token"
-    return f"{connector}:{op}:{item.ref.kind}:{item.ref.item_id}:{token}"
+    digest = hashlib.sha256(item.payload).hexdigest()[:32]
+    return f"{connector}:{op}:{item.ref.kind}:{item.ref.item_id}:{digest}"
 
 
 class Orchestrator:
@@ -161,13 +173,27 @@ class Orchestrator:
                 route.library_id, ref.external_key
             )
             if existing is not None:
+                doc_id = str(existing.get("id"))
+                # Persist the discovered document id into the cursor so the
+                # next sweep short-circuits on the cursor branch above with
+                # zero HTTP. Without this the connector re-scans the library
+                # list endpoint for every unchanged item on every sweep — the
+                # dominant request volume on large libraries whose seed cursor
+                # carried a change_token but no document id.
+                self._state.upsert(
+                    kind=ref.kind,
+                    item_id=ref.item_id,
+                    change_token=ref.change_token,
+                    external_key=ref.external_key,
+                    ironrag_document_id=doc_id,
+                )
                 return OrchestrationOutcome(
                     ref=ref,
                     action="noop_unchanged",
                     workspace_id=route.workspace_id,
                     library_id=route.library_id,
                     rule_description=route.rule_description,
-                    ironrag_document_id=str(existing.get("id")),
+                    ironrag_document_id=doc_id,
                     detail=(
                         f"change_token unchanged ({ref.change_token}); "
                         "server confirms document present"

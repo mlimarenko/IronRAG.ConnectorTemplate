@@ -2,6 +2,7 @@
 <p align="center"><b>Python framework for building data-source connectors that push content into <a href="https://github.com/mlimarenko/IronRAG">IronRAG</a>.</b></p>
 
 <p align="center">
+  <a href="https://github.com/mlimarenko/IronRAG.ConnectorTemplate/releases"><img src="https://img.shields.io/github/v/release/mlimarenko/IronRAG.ConnectorTemplate?style=flat-square&label=release" alt="Release"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" alt="License"></a>
   <img src="https://img.shields.io/badge/python-3.12%2B-blue?style=flat-square" alt="Python">
 </p>
@@ -20,7 +21,7 @@ You implement one [`SourceAdapter`](src/ironrag_connector/source.py) Protocol �
 
 ## Reference connector
 
-[`mlimarenko/IronRAG.BookStack`](https://github.com/mlimarenko/IronRAG) — production BookStack adapter built on this template, with multimodal page+image+attachment kinds.
+[`mlimarenko/IronRAG.BookStack`](https://github.com/mlimarenko/IronRAG.BookStack) — production BookStack adapter built on this template, with multimodal page+image+attachment kinds.
 
 ## Quick start
 
@@ -48,6 +49,19 @@ separate from `external_key` and does not participate in sync identity.
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — item lifecycle, failure modes, design rationale.
 - [CLAUDE.md](CLAUDE.md) — guide for future agents/devs working on the framework.
+
+## Deploy
+
+A connector built on this template ships its own `Dockerfile` (staging the
+framework as `framework/`) and a `docker-compose.yml`. See
+[`docker-compose.example.yml`](docker-compose.example.yml) for the canonical
+shape — env-file secrets, read-only config mounts, and a persistent state
+volume — and the [reference connectors](#related) for working instances.
+
+## Related
+
+- [IronRAG](https://github.com/mlimarenko/IronRAG) — the RAG backend connectors feed.
+- Connectors built on this template: [Confluence](https://github.com/mlimarenko/IronRAG.Confluence) · [BookStack](https://github.com/mlimarenko/IronRAG.BookStack) · [Git Repositories](https://github.com/mlimarenko/IronRAG.GitRepos)
 
 ## License
 

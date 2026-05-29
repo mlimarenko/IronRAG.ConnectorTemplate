@@ -35,10 +35,12 @@ class FakeIronRag:
         self.deletes: list[str] = []
         self.duplicate_for_key: str | None = None
         self.next_doc_id = 100
+        self.find_calls = 0
 
     async def find_document_by_external_key(
         self, library_id: UUID, external_key: str
     ) -> dict[str, Any] | None:
+        self.find_calls += 1
         return self.documents.get((library_id, external_key))
 
     async def upload_document(
@@ -415,6 +417,96 @@ async def test_reap_respects_ignore_policy(tmp_path: Path) -> None:
     )
     assert out.action == "skipped_missing"
     assert ironrag.deletes == []
+
+
+@pytest.mark.asyncio
+async def test_idempotency_key_is_content_addressed(tmp_path: Path) -> None:
+    """The default idempotency key must derive from the payload bytes, not
+    the change_token, so a re-rendered payload for the same logical version
+    does not collide (409) with a stuck prior attempt, and the upload and
+    replace key spaces stay separate."""
+    adapter = EchoAdapter({})
+    state = _state(tmp_path)
+    ironrag = FakeIronRag()
+    orchestrator = Orchestrator(
+        adapter=adapter,
+        ironrag=ironrag,  # type: ignore[arg-type]
+        router=Router(_routing()),
+        state=state,
+        policies=_policies(),
+    )
+
+    def _item(payload: bytes) -> SourceItem:
+        return SourceItem(
+            ref=SourceItemRef(
+                item_id="1",
+                kind="page",
+                external_key="echo:page:1",
+                change_token="vSAME",
+            ),
+            payload=payload,
+            mime_type="text/html",
+            file_name="1.html",
+            title="One",
+        )
+
+    route = Router(_routing()).resolve(_item(b"a").ref)
+
+    await orchestrator.push_item(_item(b"<p>render A</p>"), route, PushPolicy())
+    first_key = ironrag.uploads[0]["idempotency_key"]
+    # Same change_token, different bytes → different key (no false conflict).
+    state.delete("page", "1")
+    orchestrator.reset_sweep_cache()
+    ironrag.documents.clear()
+    await orchestrator.push_item(_item(b"<p>render B (different)</p>"), route, PushPolicy())
+    second_key = ironrag.uploads[1]["idempotency_key"]
+
+    assert "vSAME" not in first_key, "key must not embed change_token"
+    assert ":upload:" in first_key, "op must scope the key space"
+    assert first_key != second_key, "different payload must yield a different key"
+
+
+@pytest.mark.asyncio
+async def test_noop_persists_doc_id_to_cursor(tmp_path: Path) -> None:
+    """A seed cursor that knows change_token but not the document id must be
+    upgraded with the discovered id on the first sweep, so later sweeps
+    short-circuit with zero list-endpoint calls."""
+    adapter = EchoAdapter(
+        {"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t1")}
+    )
+    state = _state(tmp_path)
+    # Seed cursor: change_token known, document id absent.
+    state.upsert(
+        kind="page",
+        item_id="1",
+        change_token="t1",
+        external_key="echo:page:1",
+        ironrag_document_id=None,
+    )
+    ironrag = FakeIronRag()
+    ironrag.documents[(LIB, "echo:page:1")] = {
+        "id": "doc-pre",
+        "externalKey": "echo:page:1",
+    }
+    orchestrator = Orchestrator(
+        adapter=adapter,
+        ironrag=ironrag,  # type: ignore[arg-type]
+        router=Router(_routing()),
+        state=state,
+        policies=_policies(),
+    )
+
+    ref = await _first(adapter.iter_items())
+    out = await orchestrator.push_ref(ref)
+    assert out.action == "noop_unchanged"
+    assert out.ironrag_document_id == "doc-pre"
+    assert ironrag.find_calls == 1
+    assert state.get("page", "1").ironrag_document_id == "doc-pre"
+
+    # Second sweep: cursor now knows the id, so no further find calls.
+    out2 = await orchestrator.push_ref(ref)
+    assert out2.action == "noop_unchanged"
+    assert ironrag.find_calls == 1, "cursor must short-circuit the second sweep"
 
 
 async def _first(it: Any) -> Any:

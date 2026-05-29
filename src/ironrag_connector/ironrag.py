@@ -81,21 +81,45 @@ class IronRagClient:
     async def find_document_by_external_key(
         self, library_id: UUID, external_key: str
     ) -> dict[str, Any] | None:
-        """Cursor-paginate ``/v1/content/documents`` and match externalKey
-        client-side. IronRAG ≥ 0.4.11 exposes ``externalKey`` on every
-        list item, so a single pass is enough — server-side filter is
-        not yet wired so we walk pages and stop on first match."""
+        """Find a document by its exact external key.
+
+        IronRAG's list endpoint has no exact ``externalKey`` filter, but it
+        does expose ``search`` (a case-insensitive ``ILIKE`` on
+        ``external_key`` backed by a pg_trgm index). We pass the external
+        key as ``search`` to narrow the server-side result to the handful
+        of substring matches in a single request, then compare
+        ``externalKey`` exactly client-side (``search`` is a substring
+        match, so ``confluence:page:42`` would also match
+        ``confluence:page:420``). If the backend rejects ``search`` we fall
+        back to a full cursor walk and match client-side.
+
+        This replaces the previous full-library pagination (~one page per
+        200 docs, for *every* lookup) that dominated request volume against
+        large libraries.
+        """
         cursor: str | None = None
         page_size = 200
+        use_search = True
         while True:
             params: dict[str, Any] = {
                 "libraryId": str(library_id),
                 "limit": page_size,
             }
+            if use_search:
+                params["search"] = external_key
             if cursor:
                 params["cursor"] = cursor
 
             response = await self._client.get("/v1/content/documents", params=params)
+            if (
+                response.status_code in (400, 422)
+                and use_search
+                and cursor is None
+            ):
+                # Backend does not understand the search filter — retry the
+                # whole lookup as a plain paginated scan.
+                use_search = False
+                continue
             if response.status_code == 404:
                 return None
             if response.status_code >= 400:

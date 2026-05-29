@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.0.3 — 2026-05-29
+
+- `Orchestrator` default idempotency keys are now derived from a SHA-256
+  of the payload bytes (plus operation and item identity) instead of the
+  source `change_token`. A payload that is not byte-stable when
+  re-rendered for the same logical version no longer collides with a
+  stuck prior attempt (`409 idempotency_conflict`); identical retries
+  still dedupe into a single mutation.
+- `IronRagClient.find_document_by_external_key` resolves a document in a
+  single request via the list endpoint's `search` filter, comparing the
+  external key exactly client-side, and falls back to full pagination
+  when the backend does not support the filter. Replaces the per-lookup
+  full-library scan that dominated request volume on large libraries.
+- `Orchestrator.push_ref` persists the discovered document id into the
+  cursor on the unchanged path, so subsequent sweeps short-circuit via
+  the cursor with no list-endpoint calls.
+- Bumped the package version to 0.0.3.
+
 ## 0.0.2 — 2026-05-17
 
 - Added `SourceItem.document_hint`, a user-facing citation label that
