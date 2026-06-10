@@ -151,6 +151,7 @@ class IronRagClient:
         title: str | None,
         idempotency_key: str,
         document_hint: str | None = None,
+        parent_external_key: str | None = None,
     ) -> dict[str, Any]:
         files = {"file": (file_name, file_bytes, mime_type)}
         data: dict[str, Any] = {
@@ -162,6 +163,12 @@ class IronRagClient:
             data["title"] = title
         if document_hint is not None:
             data["document_hint"] = document_hint
+        if parent_external_key is not None:
+            # Declares the source-side parent so IronRAG marks this document
+            # as attached context of (or an attachment to) that parent. The
+            # backend derives document_role from the declared parent + this
+            # revision's media class; the connector sends no role itself.
+            data["parent_external_key"] = parent_external_key
         response = await self._client.post(
             "/v1/content/documents/upload", data=data, files=files
         )

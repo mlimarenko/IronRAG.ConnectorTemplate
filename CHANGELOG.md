@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.0.4 — 2026-06-10
+
+- Dependents (a page's attachments and inline images, emitted via
+  `SourceItem.dependents`) are now auto-linked to their source item. The
+  orchestrator threads the parent's `external_key` down to each dependent's
+  upload as the new `parent_external_key` multipart field; primary items
+  upload with no parent and stay `document_role=primary`. The link is
+  injected once at `Orchestrator.push_ref`, so every connector inherits
+  correct parentage with no adapter change.
+- `IronRagClient.upload_document` gained an optional `parent_external_key`
+  parameter, forwarded as the `parent_external_key` multipart form field
+  only when set. IronRAG resolves it to the canonical parent and derives
+  `document_role` (`attached_context` for image media, `attachment`
+  otherwise) — the connector sends no role itself.
+- Bumped the package version to 0.0.4.
+
 ## 0.0.3 — 2026-05-29
 
 - `Orchestrator` default idempotency keys are now derived from a SHA-256

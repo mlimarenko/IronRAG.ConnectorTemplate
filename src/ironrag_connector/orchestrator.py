@@ -219,6 +219,16 @@ class Orchestrator:
 
         primary = await self.push_item(item, route, policy)
 
+        # Single injection point for parent linkage: every dependent
+        # (a page's attachments and inline images) is uploaded declaring its
+        # source item as parent via parent_external_key. The orchestrator
+        # already knows the parent ref here, so no SourceItem.parent field is
+        # needed — this is the one source of truth for the link. confluence,
+        # bookstack, and gitrepos inherit correct parentage with no adapter
+        # change because they all emit attachments/images via
+        # SourceItem.dependents. The backend derives document_role
+        # (attached_context for image media, attachment otherwise) from the
+        # declared parent; primary items pass no parent and stay role=primary.
         dep_outcomes: list[OrchestrationOutcome] = []
         for dep in item.dependents:
             dep_policy = self._policies.for_kind(dep.ref.kind)
@@ -226,7 +236,14 @@ class Orchestrator:
                 dep_route = self._router.resolve(dep.ref)
             except RoutingError:
                 dep_route = route  # inherit parent's route if dependent unrouted
-            dep_outcomes.append(await self.push_item(dep, dep_route, dep_policy))
+            dep_outcomes.append(
+                await self.push_item(
+                    dep,
+                    dep_route,
+                    dep_policy,
+                    parent_external_key=item.ref.external_key,
+                )
+            )
 
         return OrchestrationOutcome(
             ref=primary.ref,
@@ -244,6 +261,7 @@ class Orchestrator:
         item: SourceItem,
         route: ResolvedRoute,
         policy: PushPolicy,
+        parent_external_key: str | None = None,
     ) -> OrchestrationOutcome:
         if item.ref.external_key in self._sweep_pushed:
             cached_doc_id = self._sweep_pushed[item.ref.external_key]
@@ -293,6 +311,7 @@ class Orchestrator:
                     title=item.title,
                     document_hint=item.document_hint,
                     idempotency_key=upload_key,
+                    parent_external_key=parent_external_key,
                 )
             except IronRagError as exc:
                 log.warning(
@@ -393,6 +412,7 @@ class Orchestrator:
                 title=item.title,
                 document_hint=item.document_hint,
                 idempotency_key=upload_key,
+                parent_external_key=parent_external_key,
             )
             doc = upload_result.get("document") or upload_result
             new_id = (

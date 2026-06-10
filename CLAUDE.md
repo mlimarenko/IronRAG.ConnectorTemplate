@@ -93,8 +93,20 @@ docs/ARCHITECTURE.md         — lifecycle diagram + failure modes
 5. Orchestrator looks at the cursor's `ironrag_document_id`. If set,
    calls `replace`. If unset, calls `find_document_by_external_key`,
    then `upload` or `replace` per policy.
-6. `StateStore.upsert` records the new `change_token` and doc_id.
-7. After enumeration finishes, `SyncManager._reap` lists IronRAG docs
+6. After the primary item is pushed, each `SourceItem.dependents` entry
+   is pushed declaring its source item as parent: the orchestrator
+   threads the parent's `external_key` down as `parent_external_key` on
+   the dependent's upload. Primary items carry no parent. This single
+   injection point lives in `Orchestrator.push_ref`, so an adapter only
+   has to populate `dependents` — it never sets a parent itself, and the
+   framework owns the linkage as the one source of truth. IronRAG resolves
+   `parent_external_key` to the canonical parent document and derives the
+   child's `document_role` from the declared parent plus the revision's
+   media class (image media → `attached_context`; any other dependent →
+   `attachment`). The connector sends only `parent_external_key`, never a
+   role or kind.
+7. `StateStore.upsert` records the new `change_token` and doc_id.
+8. After enumeration finishes, `SyncManager._reap` lists IronRAG docs
    under each kind's external-key prefix and deletes any not seen this
    sweep — subject to `on_missing` policy.
 
@@ -110,7 +122,10 @@ unique-violation 500.
 3. Subclass `BaseConnectorSettings` for vendor credentials.
 4. Implement `SourceAdapter`. Return one `SourceItemRef` per primary
    item; use `SourceItem.dependents` for attachments/images that ride
-   along with the parent.
+   along with the parent. The framework auto-links each dependent to its
+   source item (it uploads with `parent_external_key` = the parent's
+   `external_key`), so IronRAG marks the dependent as attached context of
+   its page — you do not set any parent field on the adapter side.
 5. Write a `__main__.py` that does
 
    ```python

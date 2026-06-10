@@ -95,3 +95,42 @@ async def test_find_returns_none_when_absent() -> None:
     await client.aclose()
 
     assert found is None
+
+
+@pytest.mark.asyncio
+async def test_upload_sends_parent_external_key_part() -> None:
+    """When parent_external_key is set it ships as a multipart form part; when
+    omitted the part is absent (so the backend leaves the doc role=primary)."""
+    bodies: list[bytes] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        bodies.append(request.content)
+        return httpx.Response(200, json={"document": {"id": "doc-1"}})
+
+    client = _client(httpx.MockTransport(handle))
+    await client.upload_document(
+        library_id=LIB,
+        external_key="source:image:1",
+        file_bytes=b"\x89PNG synthetic",
+        file_name="img.png",
+        mime_type="image/png",
+        title="Img",
+        idempotency_key="k1",
+        parent_external_key="source:page:1",
+    )
+    await client.upload_document(
+        library_id=LIB,
+        external_key="source:page:1",
+        file_bytes=b"page body",
+        file_name="page.md",
+        mime_type="text/markdown",
+        title="Page",
+        idempotency_key="k2",
+    )
+    await client.aclose()
+
+    assert b'name="parent_external_key"' in bodies[0]
+    assert b"source:page:1" in bodies[0]
+    assert b'name="parent_external_key"' not in bodies[1], (
+        "primary upload must omit the field entirely"
+    )

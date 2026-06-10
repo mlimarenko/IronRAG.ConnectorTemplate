@@ -54,6 +54,7 @@ class FakeIronRag:
         title: str | None,
         idempotency_key: str,
         document_hint: str | None = None,
+        parent_external_key: str | None = None,
     ) -> dict[str, Any]:
         self.uploads.append(
             {
@@ -63,6 +64,7 @@ class FakeIronRag:
                 "idempotency_key": idempotency_key,
                 "mime_type": mime_type,
                 "document_hint": document_hint,
+                "parent_external_key": parent_external_key,
             }
         )
         if self.duplicate_for_key == external_key:
@@ -507,6 +509,68 @@ async def test_noop_persists_doc_id_to_cursor(tmp_path: Path) -> None:
     out2 = await orchestrator.push_ref(ref)
     assert out2.action == "noop_unchanged"
     assert ironrag.find_calls == 1, "cursor must short-circuit the second sweep"
+
+
+@pytest.mark.asyncio
+async def test_dependent_uploaded_with_parent_external_key(tmp_path: Path) -> None:
+    """A page with an image dependent must upload the dependent declaring its
+    source page as parent (parent_external_key == parent.ref.external_key),
+    while the primary page uploads with parent_external_key None. This is the
+    single orchestrator injection point that gives every connector correct
+    parentage without an adapter change."""
+
+    class PageWithImageAdapter(EchoAdapter):
+        async def fetch(self, ref: SourceItemRef) -> SourceItem | None:
+            page = await super().fetch(ref)
+            if page is None:
+                return None
+            image = SourceItem(
+                ref=SourceItemRef(
+                    item_id="img-1",
+                    kind="image",
+                    external_key=self.external_key("image", "img-1"),
+                    change_token="i1",
+                ),
+                payload=b"\x89PNG\r\n\x1a\n synthetic image bytes",
+                mime_type="image/png",
+                file_name="img-1.png",
+                title="Synthetic image",
+            )
+            return SourceItem(
+                ref=page.ref,
+                payload=page.payload,
+                mime_type=page.mime_type,
+                file_name=page.file_name,
+                title=page.title,
+                dependents=(image,),
+            )
+
+    adapter = PageWithImageAdapter(
+        {"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t1")}
+    )
+    state = _state(tmp_path)
+    ironrag = FakeIronRag()
+    orchestrator = Orchestrator(
+        adapter=adapter,
+        ironrag=ironrag,  # type: ignore[arg-type]
+        router=Router(_routing()),
+        state=state,
+        policies=_policies(),
+    )
+    ref = await _first(adapter.iter_items())
+    out = await orchestrator.push_ref(ref)
+
+    assert out.action == "created"
+    assert len(out.dependent_outcomes) == 1
+    assert out.dependent_outcomes[0].action == "created"
+
+    by_key = {u["external_key"]: u for u in ironrag.uploads}
+    primary = by_key["echo:page:1"]
+    dependent = by_key["echo:image:img-1"]
+    assert primary["parent_external_key"] is None, "primary stays role=primary"
+    assert dependent["parent_external_key"] == "echo:page:1", (
+        "dependent must declare its source page as parent"
+    )
 
 
 async def _first(it: Any) -> Any:
