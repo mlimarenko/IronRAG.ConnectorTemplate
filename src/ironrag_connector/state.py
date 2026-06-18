@@ -173,6 +173,35 @@ class StateStore:
                 ),
             )
 
+    def backfill_document_identity(
+        self,
+        *,
+        kind: str,
+        item_id: str,
+        external_key: str,
+        ironrag_document_id: str | None,
+        ironrag_library_id: str | None,
+    ) -> None:
+        """Persist discovered IronRAG ownership without advancing source state."""
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                UPDATE cursor
+                SET
+                    external_key = ?,
+                    ironrag_document_id = COALESCE(?, ironrag_document_id),
+                    ironrag_library_id = COALESCE(?, ironrag_library_id)
+                WHERE kind = ? AND item_id = ?
+                """,
+                (
+                    external_key,
+                    ironrag_document_id,
+                    ironrag_library_id,
+                    kind,
+                    item_id,
+                ),
+            )
+
     def delete(self, kind: str, item_id: str) -> None:
         with self._cursor() as cur:
             cur.execute(

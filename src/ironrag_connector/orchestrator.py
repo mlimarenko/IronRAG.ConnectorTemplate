@@ -150,9 +150,7 @@ class Orchestrator:
 
         policy = self._policies.for_kind(ref.kind)
 
-        cursor = await self._resolve_cursor_library(
-            self._state.get(ref.kind, ref.item_id)
-        )
+        cursor = self._state.get(ref.kind, ref.item_id)
         if (
             cursor is not None
             and cursor.change_token is not None
@@ -187,10 +185,9 @@ class Orchestrator:
                 # list endpoint for every unchanged item on every sweep — the
                 # dominant request volume on large libraries whose seed cursor
                 # carried a change_token but no document id.
-                self._state.upsert(
+                self._state.backfill_document_identity(
                     kind=ref.kind,
                     item_id=ref.item_id,
-                    change_token=ref.change_token,
                     external_key=ref.external_key,
                     ironrag_document_id=doc_id,
                     ironrag_library_id=str(route.library_id),
@@ -205,6 +202,22 @@ class Orchestrator:
                     detail=(
                         f"change_token unchanged ({ref.change_token}); "
                         "server confirms document present"
+                    ),
+                )
+            cursor = await self._resolve_cursor_library(cursor)
+            if cursor is not None and cursor.ironrag_document_id and _cursor_matches_route(
+                cursor, route
+            ):
+                return OrchestrationOutcome(
+                    ref=ref,
+                    action="noop_unchanged",
+                    workspace_id=route.workspace_id,
+                    library_id=route.library_id,
+                    rule_description=route.rule_description,
+                    ironrag_document_id=cursor.ironrag_document_id,
+                    detail=(
+                        f"change_token unchanged ({ref.change_token}); "
+                        "cursor ownership backfilled"
                     ),
                 )
             if _cursor_ownership_unknown(cursor):
@@ -305,16 +318,38 @@ class Orchestrator:
         # already?" — the IronRAG list endpoint does not expose externalKey on
         # every deployment, so trusting find blindly would let us re-upload an
         # existing doc and trigger a unique-violation 500.
-        cursor = await self._resolve_cursor_library(
-            self._state.get(item.ref.kind, item.ref.item_id)
-        )
+        cursor = self._state.get(item.ref.kind, item.ref.item_id)
+        existing: dict[str, Any] | None = None
+        if _cursor_ownership_unknown(cursor):
+            assert cursor is not None
+            existing = await self._ironrag.find_document_by_external_key(
+                route.library_id, item.ref.external_key
+            )
+            if existing is not None:
+                doc_id = str(existing.get("id"))
+                self._state.backfill_document_identity(
+                    kind=item.ref.kind,
+                    item_id=item.ref.item_id,
+                    external_key=item.ref.external_key,
+                    ironrag_document_id=doc_id,
+                    ironrag_library_id=str(route.library_id),
+                )
+                cursor = replace(
+                    cursor,
+                    ironrag_document_id=doc_id,
+                    ironrag_library_id=str(route.library_id),
+                )
+            else:
+                cursor = await self._resolve_cursor_library(cursor)
+        else:
+            cursor = await self._resolve_cursor_library(cursor)
         if (
             cursor is not None
             and cursor.ironrag_document_id
             and _cursor_matches_route(cursor, route)
         ):
-            existing: dict[str, Any] | None = {"id": cursor.ironrag_document_id}
-        else:
+            existing = {"id": cursor.ironrag_document_id}
+        elif existing is None:
             existing = await self._ironrag.find_document_by_external_key(
                 route.library_id, item.ref.external_key
             )
@@ -609,10 +644,9 @@ class Orchestrator:
                 document_id=cursor.ironrag_document_id,
             )
             return cursor
-        self._state.upsert(
+        self._state.backfill_document_identity(
             kind=cursor.kind,
             item_id=cursor.item_id,
-            change_token=cursor.change_token,
             external_key=cursor.external_key,
             ironrag_document_id=cursor.ironrag_document_id,
             ironrag_library_id=library_id,

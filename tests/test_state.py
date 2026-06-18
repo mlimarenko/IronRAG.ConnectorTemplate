@@ -50,6 +50,37 @@ def test_upsert_preserves_document_id_when_omitted(tmp_path: Path) -> None:
     store.close()
 
 
+def test_backfill_document_identity_preserves_change_token_and_timestamp(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "s.sqlite")
+    store.upsert(
+        kind="page",
+        item_id="42",
+        change_token="t1",
+        external_key="echo:page:42",
+        ironrag_document_id=None,
+    )
+    before = store.get("page", "42")
+    assert before is not None
+
+    store.backfill_document_identity(
+        kind="page",
+        item_id="42",
+        external_key="echo:page:42",
+        ironrag_document_id="doc-1",
+        ironrag_library_id="lib-1",
+    )
+
+    row = store.get("page", "42")
+    assert row is not None
+    assert row.change_token == "t1"
+    assert row.last_pushed_at == before.last_pushed_at
+    assert row.ironrag_document_id == "doc-1"
+    assert row.ironrag_library_id == "lib-1"
+    store.close()
+
+
 def test_existing_database_is_migrated_with_library_column(tmp_path: Path) -> None:
     db = tmp_path / "s.sqlite"
     conn = sqlite3.connect(db)

@@ -120,6 +120,9 @@ def build_app(
         cursor_library_lookup_timeout_seconds=(
             settings.cursor_library_lookup_timeout_seconds
         ),
+        cursor_library_lookup_max_rows_per_sweep=(
+            settings.cursor_library_lookup_max_rows_per_sweep
+        ),
     )
 
     pidfile_path = settings.pidfile_path or Path(

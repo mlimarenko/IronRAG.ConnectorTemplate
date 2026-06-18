@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.0.7 — 2026-06-18
+
+- Added `CURSOR_LIBRARY_LOOKUP_MAX_ROWS_PER_SWEEP` to cap best-effort legacy
+  cursor library backfill before source enumeration. Large old cursor databases
+  no longer spend minutes timing out document-detail lookups before they start
+  processing source refs.
+- Optimized legacy cursor handling for the common same-route case: if a row has
+  a document id but no stored library id, the orchestrator first checks the
+  currently resolved target library by external key. When the document is found
+  there, it backfills `ironrag_library_id` without calling document detail.
+- Backfill now updates only discovered document ownership. It does not advance
+  the stored `change_token` until upload, replace, or an intentional skip
+  policy has actually handled the current source version.
+- Kept duplicate safety unchanged: if the current target does not contain the
+  document and ownership still cannot be proven, uploads remain blocked to avoid
+  creating possible duplicates.
+- Bumped the package version to 0.0.7.
+
 ## 0.0.6 — 2026-06-18
 
 - Made legacy cursor library backfill bounded and non-fatal. A sweep now

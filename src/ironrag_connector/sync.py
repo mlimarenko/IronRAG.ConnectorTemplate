@@ -86,6 +86,7 @@ class SyncManager:
         concurrency: int,
         interval_seconds: int,
         cursor_library_lookup_timeout_seconds: float = 5.0,
+        cursor_library_lookup_max_rows_per_sweep: int = 16,
     ) -> None:
         self._adapter = adapter
         self._ironrag = ironrag
@@ -96,6 +97,7 @@ class SyncManager:
         self._concurrency = concurrency
         self._interval = interval_seconds
         self._cursor_library_lookup_timeout = cursor_library_lookup_timeout_seconds
+        self._cursor_library_lookup_max_rows = cursor_library_lookup_max_rows_per_sweep
 
     async def run_once(self, *, reason: str) -> SyncReport:
         started = datetime.now(tz=UTC)
@@ -241,6 +243,8 @@ class SyncManager:
         libraries: dict[str, set[UUID]] = {}
         primary = getattr(self._adapter, "primary_kinds", self._adapter.kinds)
         lookup_sem = asyncio.Semaphore(max(1, min(self._concurrency, 8)))
+        remaining_remote_lookups = self._cursor_library_lookup_max_rows
+        deferred: dict[str, int] = {}
 
         async def resolve_row(row: Any) -> tuple[str, UUID] | None:
             library_id_raw = row.ironrag_library_id
@@ -282,10 +286,9 @@ class SyncManager:
                         document_id=row.ironrag_document_id,
                     )
                     return None
-                self._state.upsert(
+                self._state.backfill_document_identity(
                     kind=row.kind,
                     item_id=row.item_id,
-                    change_token=row.change_token,
                     external_key=row.external_key,
                     ironrag_document_id=row.ironrag_document_id,
                     ironrag_library_id=library_id_raw,
@@ -305,8 +308,18 @@ class SyncManager:
 
         for kind in primary:
             rows = self._state.items_of_kind(kind)
+            selected_rows: list[Any] = []
+            for row in rows:
+                if row.ironrag_library_id or not row.ironrag_document_id:
+                    selected_rows.append(row)
+                    continue
+                if remaining_remote_lookups > 0:
+                    selected_rows.append(row)
+                    remaining_remote_lookups -= 1
+                    continue
+                deferred[kind] = deferred.get(kind, 0) + 1
             results = await asyncio.gather(
-                *(resolve_row(row) for row in rows),
+                *(resolve_row(row) for row in selected_rows),
                 return_exceptions=False,
             )
             for result in results:
@@ -314,6 +327,13 @@ class SyncManager:
                     continue
                 result_kind, library_id = result
                 libraries.setdefault(result_kind, set()).add(library_id)
+        for kind, count in deferred.items():
+            log.info(
+                "sync.reap.cursor_library_lookup_deferred",
+                kind=kind,
+                rows=count,
+                max_rows_per_sweep=self._cursor_library_lookup_max_rows,
+            )
         return libraries
 
     async def run_forever(self, cancel_event: asyncio.Event) -> None:

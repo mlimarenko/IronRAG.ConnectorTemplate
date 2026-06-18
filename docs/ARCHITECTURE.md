@@ -89,15 +89,19 @@ kept to avoid turning transient fetch or routing failures into
 destructive deletes.
 
 Cursor databases created before `ironrag_library_id` existed are
-transitioned explicitly: when a row has an `ironrag_document_id` but no
-library id, the framework asks IronRAG for that document's detail with a
-bounded `CURSOR_LIBRARY_LOOKUP_TIMEOUT_SECONDS` timeout and backfills the
-owning library when it can. If that lookup times out or IronRAG cannot
-prove ownership, the sweep stays non-fatal and non-destructive for the
-unknown historical library; route-move cleanup for that unresolved row is
-deferred to a later sweep. The item path still refuses to upload a possible
-duplicate while ownership is unknown, so degraded backfill preserves
-duplicate-prevention over eager cleanup.
+transitioned explicitly. Before enumeration, the framework backfills at most
+`CURSOR_LIBRARY_LOOKUP_MAX_ROWS_PER_SWEEP` rows by asking IronRAG for document
+detail with a bounded `CURSOR_LIBRARY_LOOKUP_TIMEOUT_SECONDS` timeout. During
+per-item processing, a legacy row first checks the currently resolved target
+library by external key; when found, the row is upgraded without needing a
+document-detail lookup. This ownership upgrade does not advance the stored
+`change_token`; only a successful create/replace or an explicit skip policy
+marks the current source version as handled. If ownership still cannot be
+proven, the sweep stays non-fatal and non-destructive for the unknown historical
+library; route-move cleanup for that unresolved row is deferred to a later
+sweep. The item path still refuses to upload a possible duplicate while
+ownership is unknown, so degraded backfill preserves duplicate-prevention over
+eager cleanup.
 
 ## Why a Protocol instead of inheritance
 

@@ -83,6 +83,12 @@ class BaseConnectorSettings(BaseSettings):
     Keep this separate from ``request_timeout_seconds``: uploads may need a
     generous timeout, but one metadata lookup must not block a whole sweep.
     """
+    cursor_library_lookup_max_rows_per_sweep: int = Field(default=16, ge=0)
+    """Maximum legacy cursor rows to backfill before source enumeration.
+
+    Rows beyond this limit are left for per-item lazy resolution or a later
+    sweep, which keeps large old cursors from delaying the sync hot path.
+    """
 
     # --- Routing ---
     routing_config_path: Path = Field(default=Path("routing.yaml"))
