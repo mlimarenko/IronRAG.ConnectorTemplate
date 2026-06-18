@@ -77,6 +77,14 @@ list page under the adapter's external-key prefix and deletes any active
 document whose `(kind, item_id)` was not seen this sweep — subject to the
 kind's `on_missing` policy.
 
+Within one connector process, full sweeps are single-flight. Manual
+`/sync/run`, startup, and periodic triggers all share the same
+`SyncManager.run_once()` guard, so they cannot concurrently mutate the same
+cursor database or push duplicate operations to the same target. A concurrent
+manual trigger receives HTTP 409; periodic and startup triggers log a skipped
+event. If a manual request is cancelled by the caller, the framework cancels
+any in-flight item tasks and emits `sync.cancelled` before releasing the guard.
+
 The comparison also includes the routed library. Cursor rows remember
 which IronRAG library owns their document id, and each sweep takes a
 pre-push snapshot of those cursor libraries. If a connector's routing

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.0.8 — 2026-06-18
+
+- Added process-local single-flight protection for full sync sweeps. Manual
+  `/sync/run`, startup, and periodic triggers no longer run overlapping
+  `SyncManager.run_once()` calls against the same cursor database and IronRAG
+  target.
+- Manual `/sync/run` now returns HTTP 409 when a sweep is already active, while
+  periodic/startup triggers log a skipped event instead of starting a second
+  mutation pass.
+- Added cancellation cleanup for active item tasks and a structured
+  `sync.cancelled` log event when a manual request is cancelled before the
+  sweep finishes.
+- Added regression coverage for overlapping sweep rejection and item-task
+  cancellation.
+- Bumped the package version to 0.0.8.
+
 ## 0.0.7 — 2026-06-18
 
 - Added `CURSOR_LIBRARY_LOOKUP_MAX_ROWS_PER_SWEEP` to cap best-effort legacy

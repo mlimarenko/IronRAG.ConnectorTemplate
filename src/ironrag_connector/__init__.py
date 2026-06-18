@@ -30,7 +30,7 @@ from .seed import seed_cursor
 from .server import build_app
 from .source import SourceAdapter, SourceItem, SourceItemRef
 from .state import StateStore
-from .sync import SyncManager, SyncReport
+from .sync import SyncAlreadyRunningError, SyncManager, SyncReport
 
 __all__ = [
     "BaseConnectorSettings",
@@ -51,6 +51,7 @@ __all__ = [
     "SourceItem",
     "SourceItemRef",
     "StateStore",
+    "SyncAlreadyRunningError",
     "SyncManager",
     "SyncReport",
     "UpdateAction",

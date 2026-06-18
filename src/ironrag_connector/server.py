@@ -46,7 +46,7 @@ from .pidfile import PidfileLock
 from .routing import Router, load_routing_config
 from .source import SourceAdapter
 from .state import StateStore
-from .sync import SyncManager
+from .sync import SyncAlreadyRunningError, SyncManager
 
 log = get_logger(__name__)
 
@@ -142,6 +142,8 @@ def build_app(
                 async def _startup_sync() -> None:
                     try:
                         await sync_manager.run_once(reason="startup")
+                    except SyncAlreadyRunningError as exc:
+                        log.info("sync.startup_skipped", reason=str(exc))
                     except Exception as exc:
                         log.error("sync.startup_error", error=str(exc))
 
@@ -184,7 +186,13 @@ def build_app(
     @app.post("/sync/run")
     async def trigger_sync(request: Request) -> JSONResponse:
         _require_admin_bearer(settings, request)
-        report = await sync_manager.run_once(reason="manual")
+        try:
+            report = await sync_manager.run_once(reason="manual")
+        except SyncAlreadyRunningError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
         return JSONResponse(status_code=status.HTTP_200_OK, content=report.as_dict())
 
     resolved_handlers: list[WebhookHandler] = list(webhook_handlers or [])

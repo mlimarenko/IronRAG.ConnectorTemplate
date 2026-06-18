@@ -73,6 +73,10 @@ class SyncReport:
         }
 
 
+class SyncAlreadyRunningError(RuntimeError):
+    """A full sweep is already active for this connector process."""
+
+
 class SyncManager:
     def __init__(
         self,
@@ -98,8 +102,22 @@ class SyncManager:
         self._interval = interval_seconds
         self._cursor_library_lookup_timeout = cursor_library_lookup_timeout_seconds
         self._cursor_library_lookup_max_rows = cursor_library_lookup_max_rows_per_sweep
+        self._run_lock = asyncio.Lock()
 
     async def run_once(self, *, reason: str) -> SyncReport:
+        if self._run_lock.locked():
+            log.info(
+                "sync.already_running",
+                reason=reason,
+                connector=self._adapter.name,
+            )
+            raise SyncAlreadyRunningError(
+                f"sync already running for connector {self._adapter.name}"
+            )
+        async with self._run_lock:
+            return await self._run_once_unlocked(reason=reason)
+
+    async def _run_once_unlocked(self, *, reason: str) -> SyncReport:
         started = datetime.now(tz=UTC)
         log.info("sync.start", reason=reason, connector=self._adapter.name)
         report = SyncReport(started_at=started, finished_at=started)
@@ -147,6 +165,23 @@ class SyncManager:
                 tasks.append(asyncio.create_task(process(ref)))
             await asyncio.gather(*tasks, return_exceptions=False)
             sweep_completed = True
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            report.finished_at = datetime.now(tz=UTC)
+            log.warning(
+                "sync.cancelled",
+                reason=reason,
+                pending_tasks=sum(not task.done() for task in tasks),
+                **{
+                    k: v
+                    for k, v in report.as_dict().items()
+                    if k not in ("started_at", "finished_at")
+                },
+            )
+            raise
         except Exception as exc:
             log.error(
                 "sync.enumeration_error",
@@ -345,6 +380,8 @@ class SyncManager:
                 pass
             try:
                 await self.run_once(reason="periodic")
+            except SyncAlreadyRunningError as exc:
+                log.info("sync.periodic_skipped", reason=str(exc))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
