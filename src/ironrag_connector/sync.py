@@ -89,6 +89,7 @@ class SyncManager:
         policies: PolicyOverrides,
         concurrency: int,
         interval_seconds: int,
+        item_timeout_seconds: float = 300.0,
         cursor_library_lookup_timeout_seconds: float = 5.0,
         cursor_library_lookup_max_rows_per_sweep: int = 16,
     ) -> None:
@@ -100,6 +101,7 @@ class SyncManager:
         self._policies = policies
         self._concurrency = concurrency
         self._interval = interval_seconds
+        self._item_timeout = item_timeout_seconds
         self._cursor_library_lookup_timeout = cursor_library_lookup_timeout_seconds
         self._cursor_library_lookup_max_rows = cursor_library_lookup_max_rows_per_sweep
         self._run_lock = asyncio.Lock()
@@ -138,7 +140,27 @@ class SyncManager:
             report.by_kind[ref.kind] = report.by_kind.get(ref.kind, 0) + 1
             async with sem:
                 try:
-                    outcome = await self._orchestrator.push_ref(ref)
+                    log.info(
+                        "sync.item.start",
+                        kind=ref.kind,
+                        item_id=ref.item_id,
+                        external_key=ref.external_key,
+                        timeout_seconds=self._item_timeout,
+                    )
+                    outcome = await asyncio.wait_for(
+                        self._orchestrator.push_ref(ref),
+                        timeout=self._item_timeout,
+                    )
+                except TimeoutError:
+                    log.error(
+                        "sync.item_timeout",
+                        kind=ref.kind,
+                        item_id=ref.item_id,
+                        external_key=ref.external_key,
+                        timeout_seconds=self._item_timeout,
+                    )
+                    report.errors += 1
+                    return
                 except Exception as exc:
                     log.error(
                         "sync.item_error",

@@ -109,6 +109,7 @@ def _manager(
     *,
     adapter: Any,
     orchestrator: NoopOrchestrator,
+    item_timeout_seconds: float = 300.0,
 ) -> SyncManager:
     router = _router()
     return SyncManager(
@@ -120,6 +121,7 @@ def _manager(
         policies=PolicyOverrides(default=PushPolicy(), by_kind={}),
         concurrency=1,
         interval_seconds=60,
+        item_timeout_seconds=item_timeout_seconds,
     )
 
 
@@ -161,3 +163,24 @@ async def test_run_once_cancellation_cancels_item_tasks(tmp_path: Path) -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     await asyncio.wait_for(cancelled.wait(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_item_timeout_records_error_and_releases_run_lock(tmp_path: Path) -> None:
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    manager = _manager(
+        tmp_path,
+        adapter=OneRefAdapter(asyncio.Event(), asyncio.Event()),
+        orchestrator=BlockingOrchestrator(started, cancelled),
+        item_timeout_seconds=0.05,
+    )
+
+    report = await manager.run_once(reason="timeout-test")
+
+    assert report.items_seen == 1
+    assert report.errors == 1
+    await asyncio.wait_for(cancelled.wait(), timeout=1)
+
+    second = await manager.run_once(reason="after-timeout")
+    assert second.errors == 1

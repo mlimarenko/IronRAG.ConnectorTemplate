@@ -84,6 +84,10 @@ cursor database or push duplicate operations to the same target. A concurrent
 manual trigger receives HTTP 409; periodic and startup triggers log a skipped
 event. If a manual request is cancelled by the caller, the framework cancels
 any in-flight item tasks and emits `sync.cancelled` before releasing the guard.
+Each source ref is also bounded by `SYNC_ITEM_TIMEOUT_SECONDS`, including
+adapter fetch, primary push, and dependents. A timed-out item is cancelled,
+counted as an item error, and the sweep continues; `sync.item.start` and
+`sync.item_timeout` identify the affected source ref.
 
 The comparison also includes the routed library. Cursor rows remember
 which IronRAG library owns their document id, and each sweep takes a

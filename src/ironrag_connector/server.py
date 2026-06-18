@@ -117,6 +117,7 @@ def build_app(
         policies=policies,
         concurrency=settings.sync_concurrency,
         interval_seconds=settings.sync_interval_seconds,
+        item_timeout_seconds=settings.sync_item_timeout_seconds,
         cursor_library_lookup_timeout_seconds=(
             settings.cursor_library_lookup_timeout_seconds
         ),

@@ -100,6 +100,8 @@ class BaseConnectorSettings(BaseSettings):
     sync_interval_seconds: int = Field(default=1800, ge=60)
     sync_run_on_startup: bool = False
     sync_concurrency: int = Field(default=4, ge=1, le=64)
+    sync_item_timeout_seconds: float = Field(default=300.0, ge=1.0)
+    """Maximum wall-clock time for one source ref, including dependents."""
 
     # --- Persistent state ---
     state_db_path: Path = Field(default=Path("./connector-state.sqlite"))

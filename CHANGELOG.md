@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.0.9 — 2026-06-18
+
+- Added `SYNC_ITEM_TIMEOUT_SECONDS` to bound one source ref's fetch/push work,
+  including dependents. A stuck source item is cancelled, counted as an item
+  error, and the sweep can continue to `sync.done` instead of holding the
+  process-level sweep lock indefinitely.
+- Added `sync.item.start` and `sync.item_timeout` structured logs so operators
+  can see which source item is currently in flight and where a timeout happened.
+- Added regression coverage that a timed-out item cancels its task, records an
+  error, and releases the single-flight run lock for later sweeps.
+- Bumped the package version to 0.0.9.
+
 ## 0.0.8 — 2026-06-18
 
 - Added process-local single-flight protection for full sync sweeps. Manual
