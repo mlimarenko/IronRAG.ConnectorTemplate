@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.0.10 — 2026-06-18
+
+- Added `IRONRAG_MUTATION_TIMEOUT_SECONDS` for upload/replace/delete admission
+  requests. When unset, the framework derives a bounded timeout from the
+  generic HTTP timeout and `SYNC_ITEM_TIMEOUT_SECONDS`, keeping IronRAG write
+  admissions inside the per-item budget.
+- Added `ironrag.mutation.start`, `ironrag.mutation.accepted`, and
+  `ironrag.mutation.timeout` structured logs so operators can distinguish slow
+  IronRAG mutation admission from source fetch or routing work.
+- Upload/replace admission timeouts now defer the source version for a later
+  sweep without advancing the cursor. This keeps full sweeps moving and avoids
+  turning a slow backend mutation admission into an indefinite connector lock.
+- Deferred outcomes are marked structurally with `deferred=True`, so callers do
+  not have to parse human-readable detail text to recognize retry-later cases.
+- Dependents are not pushed in the same item window when the primary document
+  write is deferred, preventing dependent writes from extending an already
+  deferred source item.
+- If a dependent write is deferred after the primary document was accepted, the
+  primary cursor is restored to its previous source version so a later sweep
+  refetches the parent and retries the dependent instead of losing it behind a
+  parent `noop_unchanged`.
+- Sync reports and outcome logs now include a `deferred` count/flag for
+  retry-later mutation outcomes.
+- Added `REAPER_LIST_TIMEOUT_SECONDS` so a slow post-sweep IronRAG prefix-list
+  request cannot hold the single-flight sync lock after source enumeration has
+  already completed.
+- Added regression coverage for client-side mutation timeout classification and
+  replace deferral without cursor advancement, including dependent suppression
+  while the primary write is deferred and dependent retry after parent cursor
+  restoration, plus reaper list timeout release.
+- Bumped the package version to 0.0.10.
+
 ## 0.0.9 — 2026-06-18
 
 - Added `SYNC_ITEM_TIMEOUT_SECONDS` to bound one source ref's fetch/push work,

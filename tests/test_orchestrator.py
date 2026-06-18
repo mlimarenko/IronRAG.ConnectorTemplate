@@ -8,7 +8,7 @@ import httpx
 import pytest
 from echo_connector.adapter import EchoAdapter, EchoPage
 
-from ironrag_connector.ironrag import IronRagError
+from ironrag_connector.ironrag import IronRagError, IronRagMutationTimeoutError
 from ironrag_connector.orchestrator import Orchestrator
 from ironrag_connector.policy import (
     DeleteAction,
@@ -514,6 +514,49 @@ async def test_cursor_wins_over_server_find(tmp_path: Path) -> None:
     assert out.action == "replaced"
     assert ironrag.uploads == [], "must not upload — cursor knew doc_id"
     assert ironrag.replaces and ironrag.replaces[0]["document_id"] == "doc-pre"
+
+
+@pytest.mark.asyncio
+async def test_replace_timeout_is_deferred_without_advancing_cursor(tmp_path: Path) -> None:
+    adapter = EchoAdapter(
+        {"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t2")}
+    )
+    state = _state(tmp_path)
+    state.upsert(
+        kind="page",
+        item_id="1",
+        change_token="t1",
+        external_key="echo:page:1",
+        ironrag_document_id="doc-pre",
+        ironrag_library_id=str(LIB),
+    )
+
+    class TimeoutIronRag(FakeIronRag):
+        async def replace_document(self, **kwargs: Any) -> dict[str, Any]:
+            raise IronRagMutationTimeoutError("synthetic mutation timeout")
+
+    ironrag = TimeoutIronRag()
+    ironrag.documents[(LIB, "echo:page:1")] = {
+        "id": "doc-pre",
+        "externalKey": "echo:page:1",
+    }
+    orchestrator = Orchestrator(
+        adapter=adapter,
+        ironrag=ironrag,  # type: ignore[arg-type]
+        router=Router(_routing()),
+        state=state,
+        policies=_policies(),
+    )
+
+    ref = await _first(adapter.iter_items())
+    out = await orchestrator.push_ref(ref)
+
+    assert out.action == "skipped_changed"
+    assert out.ironrag_document_id == "doc-pre"
+    assert out.deferred is True
+    row = state.get("page", "1")
+    assert row is not None
+    assert row.change_token == "t1", "deferred replace must retry the new version later"
 
 
 @pytest.mark.asyncio
@@ -1089,6 +1132,165 @@ async def test_dependent_uploaded_with_parent_external_key(tmp_path: Path) -> No
     assert dependent["parent_external_key"] == "echo:page:1", (
         "dependent must declare its source page as parent"
     )
+
+
+@pytest.mark.asyncio
+async def test_dependent_waits_when_primary_replace_is_deferred(tmp_path: Path) -> None:
+    class PageWithImageAdapter(EchoAdapter):
+        async def fetch(self, ref: SourceItemRef) -> SourceItem | None:
+            page = await super().fetch(ref)
+            if page is None:
+                return None
+            image = SourceItem(
+                ref=SourceItemRef(
+                    item_id="img-1",
+                    kind="image",
+                    external_key=self.external_key("image", "img-1"),
+                    change_token="i1",
+                ),
+                payload=b"\x89PNG\r\n\x1a\n synthetic image bytes",
+                mime_type="image/png",
+                file_name="img-1.png",
+                title="Synthetic image",
+            )
+            return SourceItem(
+                ref=page.ref,
+                payload=page.payload,
+                mime_type=page.mime_type,
+                file_name=page.file_name,
+                title=page.title,
+                dependents=(image,),
+            )
+
+    class TimeoutReplaceIronRag(FakeIronRag):
+        async def replace_document(self, **kwargs: Any) -> dict[str, Any]:
+            raise IronRagMutationTimeoutError("synthetic mutation timeout")
+
+    adapter = PageWithImageAdapter(
+        {"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t2")}
+    )
+    state = _state(tmp_path)
+    state.upsert(
+        kind="page",
+        item_id="1",
+        change_token="t1",
+        external_key="echo:page:1",
+        ironrag_document_id="doc-pre",
+        ironrag_library_id=str(LIB),
+    )
+    ironrag = TimeoutReplaceIronRag()
+    orchestrator = Orchestrator(
+        adapter=adapter,
+        ironrag=ironrag,  # type: ignore[arg-type]
+        router=Router(_routing()),
+        state=state,
+        policies=_policies(),
+    )
+
+    out = await orchestrator.push_ref(await _first(adapter.iter_items()))
+
+    assert out.action == "skipped_changed"
+    assert out.deferred is True
+    assert out.dependent_outcomes == ()
+    assert ironrag.uploads == []
+    row = state.get("page", "1")
+    assert row is not None
+    assert row.change_token == "t1"
+
+
+@pytest.mark.asyncio
+async def test_dependent_deferral_restores_parent_cursor_for_retry(
+    tmp_path: Path,
+) -> None:
+    class PageWithImageAdapter(EchoAdapter):
+        async def fetch(self, ref: SourceItemRef) -> SourceItem | None:
+            page = await super().fetch(ref)
+            if page is None:
+                return None
+            image = SourceItem(
+                ref=SourceItemRef(
+                    item_id="img-1",
+                    kind="image",
+                    external_key=self.external_key("image", "img-1"),
+                    change_token="i1",
+                ),
+                payload=b"\x89PNG\r\n\x1a\n synthetic image bytes",
+                mime_type="image/png",
+                file_name="img-1.png",
+                title="Synthetic image",
+            )
+            return SourceItem(
+                ref=page.ref,
+                payload=page.payload,
+                mime_type=page.mime_type,
+                file_name=page.file_name,
+                title=page.title,
+                dependents=(image,),
+            )
+
+    class OneTimeoutImageUploadIronRag(FakeIronRag):
+        def __init__(self) -> None:
+            super().__init__()
+            self.image_upload_attempts = 0
+
+        async def upload_document(self, **kwargs: Any) -> dict[str, Any]:
+            if kwargs["external_key"] == "echo:image:img-1":
+                self.image_upload_attempts += 1
+                if self.image_upload_attempts == 1:
+                    raise IronRagMutationTimeoutError("synthetic mutation timeout")
+            return await super().upload_document(**kwargs)
+
+    adapter = PageWithImageAdapter(
+        {"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t2")}
+    )
+    state = _state(tmp_path)
+    state.upsert(
+        kind="page",
+        item_id="1",
+        change_token="t1",
+        external_key="echo:page:1",
+        ironrag_document_id="doc-pre",
+        ironrag_library_id=str(LIB),
+    )
+    ironrag = OneTimeoutImageUploadIronRag()
+    ironrag.documents[(LIB, "echo:page:1")] = {
+        "id": "doc-pre",
+        "externalKey": "echo:page:1",
+    }
+    orchestrator = Orchestrator(
+        adapter=adapter,
+        ironrag=ironrag,  # type: ignore[arg-type]
+        router=Router(_routing()),
+        state=state,
+        policies=_policies(),
+    )
+    ref = await _first(adapter.iter_items())
+
+    first = await orchestrator.push_ref(ref)
+
+    assert first.action == "replaced"
+    assert first.deferred is True
+    assert len(first.dependent_outcomes) == 1
+    assert first.dependent_outcomes[0].action == "skipped_new"
+    assert first.dependent_outcomes[0].deferred is True
+    assert ironrag.image_upload_attempts == 1
+    parent_row = state.get("page", "1")
+    assert parent_row is not None
+    assert parent_row.change_token == "t1"
+    assert state.get("image", "img-1") is None
+
+    orchestrator.reset_sweep_cache()
+    second = await orchestrator.push_ref(ref)
+
+    assert second.action == "replaced"
+    assert second.deferred is False
+    assert len(second.dependent_outcomes) == 1
+    assert second.dependent_outcomes[0].action == "created"
+    assert ironrag.image_upload_attempts == 2
+    assert state.get("page", "1").change_token == "t2"
+    image_row = state.get("image", "img-1")
+    assert image_row is not None
+    assert image_row.change_token == "i1"
 
 
 async def _first(it: Any) -> Any:

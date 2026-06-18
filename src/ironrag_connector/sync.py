@@ -49,6 +49,7 @@ class SyncReport:
     skipped: int = 0
     skipped_duplicate_content: int = 0
     skipped_missing: int = 0
+    deferred: int = 0
     unrouted: int = 0
     reaped: int = 0
     errors: int = 0
@@ -66,6 +67,7 @@ class SyncReport:
             "skipped": self.skipped,
             "skipped_duplicate_content": self.skipped_duplicate_content,
             "skipped_missing": self.skipped_missing,
+            "deferred": self.deferred,
             "unrouted": self.unrouted,
             "reaped": self.reaped,
             "errors": self.errors,
@@ -92,6 +94,7 @@ class SyncManager:
         item_timeout_seconds: float = 300.0,
         cursor_library_lookup_timeout_seconds: float = 5.0,
         cursor_library_lookup_max_rows_per_sweep: int = 16,
+        reaper_list_timeout_seconds: float = 30.0,
     ) -> None:
         self._adapter = adapter
         self._ironrag = ironrag
@@ -104,6 +107,7 @@ class SyncManager:
         self._item_timeout = item_timeout_seconds
         self._cursor_library_lookup_timeout = cursor_library_lookup_timeout_seconds
         self._cursor_library_lookup_max_rows = cursor_library_lookup_max_rows_per_sweep
+        self._reaper_list_timeout = reaper_list_timeout_seconds
         self._run_lock = asyncio.Lock()
 
     async def run_once(self, *, reason: str) -> SyncReport:
@@ -253,9 +257,18 @@ class SyncManager:
             target_libs = current_target_libs | cursor_libraries.get(kind, set())
             for library_id in target_libs:
                 try:
-                    pairs = await self._ironrag.list_documents_by_external_key_prefix(
-                        library_id, prefix
+                    async with asyncio.timeout(self._reaper_list_timeout):
+                        pairs = await self._ironrag.list_documents_by_external_key_prefix(
+                            library_id, prefix
+                        )
+                except TimeoutError:
+                    log.warning(
+                        "sync.reap.list_timeout",
+                        library_id=str(library_id),
+                        prefix=prefix,
+                        timeout_seconds=self._reaper_list_timeout,
                     )
+                    continue
                 except IronRagError as exc:
                     log.warning(
                         "sync.reap.list_error",
@@ -422,6 +435,7 @@ def _log_outcome(outcome: OrchestrationOutcome) -> None:
         library_id=str(outcome.library_id) if outcome.library_id else None,
         rule=outcome.rule_description,
         detail=outcome.detail,
+        deferred=outcome.deferred,
         title=(outcome.ref.raw or {}).get("name")
         or (outcome.ref.raw or {}).get("title"),
     )
@@ -458,6 +472,8 @@ def _document_still_expected(
 
 
 def _tally(report: SyncReport, outcome: OrchestrationOutcome) -> None:
+    if outcome.deferred:
+        report.deferred += 1
     action = outcome.action
     if action == "created":
         report.created += 1

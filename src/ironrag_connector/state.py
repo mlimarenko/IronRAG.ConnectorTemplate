@@ -209,6 +209,38 @@ class StateStore:
                 (kind, item_id),
             )
 
+    def restore(self, row: CursorRow | None, *, kind: str, item_id: str) -> None:
+        """Restore one cursor row exactly, or delete it when ``row`` is absent."""
+        if row is None:
+            self.delete(kind, item_id)
+            return
+        if row.kind != kind or row.item_id != item_id:
+            raise ValueError("cursor restore target does not match row identity")
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO cursor (
+                    kind, item_id, change_token, external_key,
+                    ironrag_document_id, ironrag_library_id, last_pushed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(kind, item_id) DO UPDATE SET
+                    change_token = excluded.change_token,
+                    external_key = excluded.external_key,
+                    ironrag_document_id = excluded.ironrag_document_id,
+                    ironrag_library_id = excluded.ironrag_library_id,
+                    last_pushed_at = excluded.last_pushed_at
+                """,
+                (
+                    row.kind,
+                    row.item_id,
+                    row.change_token,
+                    row.external_key,
+                    row.ironrag_document_id,
+                    row.ironrag_library_id,
+                    row.last_pushed_at,
+                ),
+            )
+
     def items_of_kind(self, kind: str) -> list[CursorRow]:
         with self._cursor() as cur:
             rows = cur.execute(

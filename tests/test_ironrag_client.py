@@ -6,7 +6,11 @@ import httpx
 import pytest
 
 from ironrag_connector.config import BaseConnectorSettings
-from ironrag_connector.ironrag import IronRagClient, document_library_id
+from ironrag_connector.ironrag import (
+    IronRagClient,
+    IronRagMutationTimeoutError,
+    document_library_id,
+)
 
 LIB = UUID("00000000-0000-0000-0000-000000000000")
 
@@ -15,6 +19,7 @@ def _settings() -> BaseConnectorSettings:
     return BaseConnectorSettings(
         ironrag_base_url="http://ironrag.example.com",
         ironrag_api_token="token",
+        request_timeout_seconds=60.0,
     )
 
 
@@ -268,3 +273,56 @@ async def test_upload_sends_parent_external_key_part() -> None:
     assert b'name="parent_external_key"' not in bodies[1], (
         "primary upload must omit the field entirely"
     )
+
+
+@pytest.mark.asyncio
+async def test_upload_timeout_raises_mutation_timeout() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("synthetic timeout", request=request)
+
+    client = _client(httpx.MockTransport(handle))
+
+    with pytest.raises(IronRagMutationTimeoutError, match="upload admission timed out"):
+        await client.upload_document(
+            library_id=LIB,
+            external_key="source:page:1",
+            file_bytes=b"page body",
+            file_name="page.md",
+            mime_type="text/markdown",
+            title="Page",
+            idempotency_key="k1",
+        )
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_replace_timeout_raises_mutation_timeout() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("synthetic timeout", request=request)
+
+    client = _client(httpx.MockTransport(handle))
+
+    with pytest.raises(IronRagMutationTimeoutError, match="replace admission timed out"):
+        await client.replace_document(
+            document_id="doc-1",
+            file_bytes=b"page body",
+            file_name="page.md",
+            mime_type="text/markdown",
+            idempotency_key="k1",
+        )
+
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_delete_timeout_raises_mutation_timeout() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("synthetic timeout", request=request)
+
+    client = _client(httpx.MockTransport(handle))
+
+    with pytest.raises(IronRagMutationTimeoutError, match="delete admission timed out"):
+        await client.delete_document("doc-1", "k1")
+
+    await client.aclose()

@@ -89,6 +89,28 @@ adapter fetch, primary push, and dependents. A timed-out item is cancelled,
 counted as an item error, and the sweep continues; `sync.item.start` and
 `sync.item_timeout` identify the affected source ref.
 
+IronRAG write admissions have a narrower budget than generic HTTP calls.
+`IRONRAG_MUTATION_TIMEOUT_SECONDS` bounds upload/replace/delete admission
+requests; if unset, the framework derives it from `REQUEST_TIMEOUT_SECONDS`
+and `SYNC_ITEM_TIMEOUT_SECONDS`. A mutation admission timeout is treated as a
+deferred retry, not as a handled source version: the cursor is not advanced,
+the source item remains eligible for the next sweep, the orchestration outcome
+is marked `deferred=True`, and `ironrag.mutation.*` logs identify whether the
+request was accepted or timed out. When a primary document write is deferred,
+its dependent documents wait for the next sweep rather than spending the
+current item budget on child mutations whose parent state is still pending. If
+a dependent document is deferred after the primary write was accepted, the
+primary cursor is restored to its previous source version; that forces the
+next sweep to refetch the parent, while already-successful dependents can still
+short-circuit through their own cursor rows. Sync reports expose retry-later
+outcomes through a `deferred` counter.
+
+The orphan reaper also has its own bounded IronRAG list budget.
+`REAPER_LIST_TIMEOUT_SECONDS` wraps each prefix-list request made after source
+enumeration. If the backend listing endpoint is slow, the reaper skips that
+library/prefix for the sweep and releases the single-flight sync lock instead
+of holding `/sync/run` until the generic HTTP timeout expires.
+
 The comparison also includes the routed library. Cursor rows remember
 which IronRAG library owns their document id, and each sweep takes a
 pre-push snapshot of those cursor libraries. If a connector's routing

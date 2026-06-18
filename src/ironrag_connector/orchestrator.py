@@ -34,7 +34,7 @@ from uuid import UUID, uuid4
 
 import httpx
 
-from .ironrag import IronRagClient, IronRagError, document_library_id
+from .ironrag import IronRagClient, IronRagError, IronRagMutationTimeoutError, document_library_id
 from .observability import get_logger
 from .policy import (
     DeleteAction,
@@ -73,6 +73,7 @@ class OrchestrationOutcome:
     rule_description: str | None
     ironrag_document_id: str | None
     detail: str
+    deferred: bool = False
     dependent_outcomes: tuple[OrchestrationOutcome, ...] = field(default_factory=tuple)
 
 
@@ -97,6 +98,11 @@ def _default_idempotency_key(connector: str, item: SourceItem, op: str) -> str:
     """
     digest = hashlib.sha256(item.payload).hexdigest()[:32]
     return f"{connector}:{op}:{item.ref.kind}:{item.ref.item_id}:{digest}"
+
+
+def _primary_deferred(outcome: OrchestrationOutcome) -> bool:
+    """Primary write is intentionally retried later, so dependents wait too."""
+    return outcome.deferred
 
 
 class Orchestrator:
@@ -244,7 +250,17 @@ class Orchestrator:
                 detail="adapter.fetch returned None",
             )
 
+        parent_cursor_before_push = self._state.get(ref.kind, ref.item_id)
         primary = await self.push_item(item, route, policy)
+        if _primary_deferred(primary):
+            log.info(
+                "orchestrator.dependents_deferred",
+                kind=ref.kind,
+                item_id=ref.item_id,
+                action=primary.action,
+                detail=primary.detail,
+            )
+            return primary
 
         # Single injection point for parent linkage: every dependent
         # (a page's attachments and inline images) is uploaded declaring its
@@ -263,13 +279,29 @@ class Orchestrator:
                 dep_route = self._router.resolve(dep.ref)
             except RoutingError:
                 dep_route = route  # inherit parent's route if dependent unrouted
-            dep_outcomes.append(
-                await self.push_item(
-                    dep,
-                    dep_route,
-                    dep_policy,
-                    parent_external_key=item.ref.external_key,
-                )
+            dep_outcome = await self.push_item(
+                dep,
+                dep_route,
+                dep_policy,
+                parent_external_key=item.ref.external_key,
+            )
+            dep_outcomes.append(dep_outcome)
+            if dep_outcome.deferred:
+                break
+
+        has_deferred_dependent = any(dep.deferred for dep in dep_outcomes)
+        if has_deferred_dependent:
+            self._state.restore(
+                parent_cursor_before_push,
+                kind=ref.kind,
+                item_id=ref.item_id,
+            )
+            log.info(
+                "orchestrator.primary_deferred_by_dependent",
+                kind=ref.kind,
+                item_id=ref.item_id,
+                action=primary.action,
+                dependent_count=len(dep_outcomes),
             )
 
         return OrchestrationOutcome(
@@ -279,7 +311,12 @@ class Orchestrator:
             library_id=primary.library_id,
             rule_description=primary.rule_description,
             ironrag_document_id=primary.ironrag_document_id,
-            detail=primary.detail,
+            detail=(
+                f"{primary.detail}; dependent write deferred; retry next sweep"
+                if has_deferred_dependent
+                else primary.detail
+            ),
+            deferred=primary.deferred or has_deferred_dependent,
             dependent_outcomes=tuple(dep_outcomes),
         )
 
@@ -375,6 +412,21 @@ class Orchestrator:
                     idempotency_key=upload_key,
                     parent_external_key=parent_external_key,
                 )
+            except IronRagMutationTimeoutError as exc:
+                log.warning(
+                    "orchestrator.upload_deferred",
+                    external_key=item.ref.external_key,
+                    reason="mutation_timeout",
+                    error=str(exc),
+                )
+                return _outcome(
+                    item.ref,
+                    route,
+                    "skipped_new",
+                    None,
+                    "upload admission timed out; retry next sweep",
+                    deferred=True,
+                )
             except IronRagError as exc:
                 log.warning(
                     "orchestrator.upload_failed",
@@ -459,6 +511,23 @@ class Orchestrator:
                 idempotency_key=replace_key,
                 document_hint=item.document_hint,
             )
+        except IronRagMutationTimeoutError as exc:
+            log.info(
+                "orchestrator.replace_deferred",
+                external_key=item.ref.external_key,
+                document_id=str(document_id),
+                reason="mutation_timeout",
+                error=str(exc),
+            )
+            self._sweep_pushed[cache_key] = str(document_id)
+            return _outcome(
+                item.ref,
+                route,
+                "skipped_changed",
+                str(document_id),
+                "replace admission timed out; retry next sweep",
+                deferred=True,
+            )
         except IronRagError as exc:
             if _is_conflicting_mutation(exc):
                 log.info(
@@ -474,6 +543,7 @@ class Orchestrator:
                     "skipped_changed",
                     str(document_id),
                     "document has a pending mutation; retry next sweep",
+                    deferred=True,
                 )
             raise
         if replace_result is None:
@@ -660,6 +730,8 @@ def _outcome(
     action: OutcomeAction,
     document_id: str | None,
     detail: str,
+    *,
+    deferred: bool = False,
 ) -> OrchestrationOutcome:
     return OrchestrationOutcome(
         ref=ref,
@@ -669,6 +741,7 @@ def _outcome(
         rule_description=route.rule_description,
         ironrag_document_id=document_id,
         detail=detail,
+        deferred=deferred,
     )
 
 

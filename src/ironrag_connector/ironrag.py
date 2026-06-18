@@ -52,6 +52,10 @@ class IronRagError(RuntimeError):
     """IronRAG returned a non-recoverable status."""
 
 
+class IronRagMutationTimeoutError(IronRagError):
+    """IronRAG write admission did not return inside the connector budget."""
+
+
 class IronRagClient:
     def __init__(
         self,
@@ -60,6 +64,12 @@ class IronRagClient:
     ) -> None:
         self._settings = settings
         self._owns_client = client is None
+        configured_mutation_timeout = settings.ironrag_mutation_timeout_seconds
+        item_budget = max(1.0, settings.sync_item_timeout_seconds - 5.0)
+        self._mutation_timeout = configured_mutation_timeout or min(
+            settings.request_timeout_seconds,
+            item_budget,
+        )
         self._client = client or httpx.AsyncClient(
             base_url=settings.ironrag_base_url.rstrip("/"),
             timeout=settings.request_timeout_seconds,
@@ -170,9 +180,29 @@ class IronRagClient:
             # backend derives document_role from the declared parent + this
             # revision's media class; the connector sends no role itself.
             data["parent_external_key"] = parent_external_key
-        response = await self._client.post(
-            "/v1/content/documents/upload", data=data, files=files
+        log.info(
+            "ironrag.mutation.start",
+            operation="upload",
+            external_key=external_key,
+            timeout_seconds=self._mutation_timeout,
         )
+        try:
+            response = await self._client.post(
+                "/v1/content/documents/upload",
+                data=data,
+                files=files,
+                timeout=self._mutation_timeout,
+            )
+        except httpx.TimeoutException as exc:
+            log.warning(
+                "ironrag.mutation.timeout",
+                operation="upload",
+                external_key=external_key,
+                timeout_seconds=self._mutation_timeout,
+            )
+            raise IronRagMutationTimeoutError(
+                f"IronRAG upload admission timed out after {self._mutation_timeout:.1f}s"
+            ) from exc
 
         if response.status_code == 409:
             try:
@@ -198,7 +228,14 @@ class IronRagClient:
             raise IronRagError(
                 f"IronRAG upload → {response.status_code}: {response.text[:400]}"
             )
-        return _json_object(response)
+        payload = _json_object(response)
+        log.info(
+            "ironrag.mutation.accepted",
+            operation="upload",
+            external_key=external_key,
+            status_code=response.status_code,
+        )
+        return payload
 
     async def replace_document(
         self,
@@ -217,16 +254,43 @@ class IronRagClient:
         data = {"idempotency_key": idempotency_key}
         if document_hint is not None:
             data["document_hint"] = document_hint
-        response = await self._client.post(
-            f"/v1/content/documents/{document_id}/replace", data=data, files=files
+        log.info(
+            "ironrag.mutation.start",
+            operation="replace",
+            document_id=str(document_id),
+            timeout_seconds=self._mutation_timeout,
         )
+        try:
+            response = await self._client.post(
+                f"/v1/content/documents/{document_id}/replace",
+                data=data,
+                files=files,
+                timeout=self._mutation_timeout,
+            )
+        except httpx.TimeoutException as exc:
+            log.warning(
+                "ironrag.mutation.timeout",
+                operation="replace",
+                document_id=str(document_id),
+                timeout_seconds=self._mutation_timeout,
+            )
+            raise IronRagMutationTimeoutError(
+                f"IronRAG replace admission timed out after {self._mutation_timeout:.1f}s"
+            ) from exc
         if response.status_code in (404, 410):
             return None
         if response.status_code >= 400:
             raise IronRagError(
                 f"IronRAG replace → {response.status_code}: {response.text[:400]}"
             )
-        return _json_object(response)
+        payload = _json_object(response)
+        log.info(
+            "ironrag.mutation.accepted",
+            operation="replace",
+            document_id=str(document_id),
+            status_code=response.status_code,
+        )
+        return payload
 
     async def get_document(self, document_id: UUID | str) -> dict[str, Any] | None:
         response = await self._client.get(f"/v1/content/documents/{document_id}")
@@ -321,12 +385,36 @@ class IronRagClient:
     async def delete_document(
         self, document_id: UUID | str, idempotency_key: str
     ) -> None:
-        response = await self._client.request(
-            "DELETE",
-            f"/v1/content/documents/{document_id}",
-            headers={"Idempotency-Key": idempotency_key},
+        log.info(
+            "ironrag.mutation.start",
+            operation="delete",
+            document_id=str(document_id),
+            timeout_seconds=self._mutation_timeout,
         )
+        try:
+            response = await self._client.request(
+                "DELETE",
+                f"/v1/content/documents/{document_id}",
+                headers={"Idempotency-Key": idempotency_key},
+                timeout=self._mutation_timeout,
+            )
+        except httpx.TimeoutException as exc:
+            log.warning(
+                "ironrag.mutation.timeout",
+                operation="delete",
+                document_id=str(document_id),
+                timeout_seconds=self._mutation_timeout,
+            )
+            raise IronRagMutationTimeoutError(
+                f"IronRAG delete admission timed out after {self._mutation_timeout:.1f}s"
+            ) from exc
         if response.status_code in (200, 202, 204, 404):
+            log.info(
+                "ironrag.mutation.accepted",
+                operation="delete",
+                document_id=str(document_id),
+                status_code=response.status_code,
+            )
             return
         raise IronRagError(
             f"IronRAG delete → {response.status_code}: {response.text[:400]}"

@@ -124,6 +124,7 @@ def build_app(
         cursor_library_lookup_max_rows_per_sweep=(
             settings.cursor_library_lookup_max_rows_per_sweep
         ),
+        reaper_list_timeout_seconds=settings.reaper_list_timeout_seconds,
     )
 
     pidfile_path = settings.pidfile_path or Path(

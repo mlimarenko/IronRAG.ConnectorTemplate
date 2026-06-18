@@ -62,6 +62,18 @@ class FakeIronRag:
         return None
 
 
+class SlowListIronRag(FakeIronRag):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def list_documents_by_external_key_prefix(
+        self, *_: Any, **__: Any
+    ) -> list[tuple[str, str]]:
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("slow reaper list should time out")
+
+
 class NoopOrchestrator:
     def reset_sweep_cache(self) -> None:
         pass
@@ -109,12 +121,14 @@ def _manager(
     *,
     adapter: Any,
     orchestrator: NoopOrchestrator,
+    ironrag: Any | None = None,
     item_timeout_seconds: float = 300.0,
+    reaper_list_timeout_seconds: float = 30.0,
 ) -> SyncManager:
     router = _router()
     return SyncManager(
         adapter=adapter,
-        ironrag=FakeIronRag(),  # type: ignore[arg-type]
+        ironrag=ironrag or FakeIronRag(),  # type: ignore[arg-type]
         orchestrator=orchestrator,  # type: ignore[arg-type]
         router=router,
         state=StateStore(tmp_path / "state.sqlite"),
@@ -122,6 +136,7 @@ def _manager(
         concurrency=1,
         interval_seconds=60,
         item_timeout_seconds=item_timeout_seconds,
+        reaper_list_timeout_seconds=reaper_list_timeout_seconds,
     )
 
 
@@ -184,3 +199,24 @@ async def test_item_timeout_records_error_and_releases_run_lock(tmp_path: Path) 
 
     second = await manager.run_once(reason="after-timeout")
     assert second.errors == 1
+
+
+@pytest.mark.asyncio
+async def test_reaper_list_timeout_releases_run_lock(tmp_path: Path) -> None:
+    ironrag = SlowListIronRag()
+    manager = _manager(
+        tmp_path,
+        adapter=OneRefAdapter(asyncio.Event(), asyncio.Event()),
+        orchestrator=NoopOrchestrator(),
+        ironrag=ironrag,
+        reaper_list_timeout_seconds=0.01,
+    )
+
+    report = await asyncio.wait_for(manager.run_once(reason="reaper-timeout"), timeout=1)
+
+    assert report.items_seen == 1
+    assert report.errors == 0
+    assert ironrag.started.is_set()
+
+    second = await asyncio.wait_for(manager.run_once(reason="after-reaper"), timeout=1)
+    assert second.items_seen == 1

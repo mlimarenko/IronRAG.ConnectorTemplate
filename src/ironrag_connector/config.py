@@ -77,6 +77,14 @@ class BaseConnectorSettings(BaseSettings):
     ironrag_base_url: str
     ironrag_api_token: str
     request_timeout_seconds: float = Field(60.0, ge=1.0)
+    ironrag_mutation_timeout_seconds: float | None = Field(default=None, ge=1.0)
+    """Timeout for IronRAG write-admission requests.
+
+    Defaults to the smaller of ``REQUEST_TIMEOUT_SECONDS`` and
+    ``SYNC_ITEM_TIMEOUT_SECONDS - 5s``. This keeps upload/replace/delete
+    admissions inside the per-item budget while leaving read/list requests
+    free to use the broader generic HTTP timeout.
+    """
     cursor_library_lookup_timeout_seconds: float = Field(default=5.0, ge=0.1)
     """Timeout for best-effort legacy cursor library lookups.
 
@@ -88,6 +96,13 @@ class BaseConnectorSettings(BaseSettings):
 
     Rows beyond this limit are left for per-item lazy resolution or a later
     sweep, which keeps large old cursors from delaying the sync hot path.
+    """
+    reaper_list_timeout_seconds: float = Field(default=30.0, ge=1.0)
+    """Maximum time for one IronRAG reaper prefix-list request.
+
+    Reaping runs after item enumeration, outside the per-item timeout. This
+    bound prevents a slow document listing endpoint from holding the whole
+    sweep lock after source processing has finished.
     """
 
     # --- Routing ---
