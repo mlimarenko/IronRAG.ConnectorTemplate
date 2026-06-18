@@ -129,6 +129,7 @@ async def _seed_library(
                 change_token=None,
                 external_key=external_key,
                 ironrag_document_id=str(doc_id),
+                ironrag_library_id=str(library_id),
             )
             counts["rows_inserted"] += 1
 

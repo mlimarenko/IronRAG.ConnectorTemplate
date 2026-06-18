@@ -72,9 +72,28 @@ noop_unchanged   Orchestrator.push_item
 ```
 
 The reaper runs after enumeration completes successfully: for every
-`kind` the adapter declares, the framework lists IronRAG documents under
-the adapter's external-key prefix and deletes any whose `(kind, item_id)`
-was not seen this sweep — subject to the kind's `on_missing` policy.
+primary `kind` the adapter declares, the framework walks every IronRAG
+list page under the adapter's external-key prefix and deletes any active
+document whose `(kind, item_id)` was not seen this sweep — subject to the
+kind's `on_missing` policy.
+
+The comparison also includes the routed library. Cursor rows remember
+which IronRAG library owns their document id, and each sweep takes a
+pre-push snapshot of those cursor libraries. If a connector's routing
+rules move a still-existing source item from one library to another, the
+orchestrator creates or updates the document in the newly resolved
+library, and the reaper scans the previous cursor library to delete the
+old target document. If an item was enumerated but did not establish a
+successful route/push target in the current sweep, existing documents are
+kept to avoid turning transient fetch or routing failures into
+destructive deletes.
+
+Cursor databases created before `ironrag_library_id` existed are
+transitioned explicitly: when a row has an `ironrag_document_id` but no
+library id, the framework asks IronRAG for that document's detail and
+backfills the owning library before trusting the cached document id. If
+IronRAG cannot prove the ownership, the connector refuses to upload a
+possible duplicate instead of guessing.
 
 ## Why a Protocol instead of inheritance
 

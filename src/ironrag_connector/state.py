@@ -29,6 +29,7 @@ Schema
         change_token TEXT,
         external_key TEXT NOT NULL,
         ironrag_document_id TEXT,
+        ironrag_library_id TEXT,
         last_pushed_at TEXT NOT NULL,
         PRIMARY KEY (kind, item_id)
     );
@@ -56,6 +57,7 @@ class CursorRow:
     change_token: str | None
     external_key: str
     ironrag_document_id: str | None
+    ironrag_library_id: str | None
     last_pushed_at: str
 
 
@@ -69,6 +71,7 @@ class StateStore:
         change_token TEXT,
         external_key TEXT NOT NULL,
         ironrag_document_id TEXT,
+        ironrag_library_id TEXT,
         last_pushed_at TEXT NOT NULL,
         PRIMARY KEY (kind, item_id)
     );
@@ -89,6 +92,7 @@ class StateStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(self._SCHEMA)
+        self._migrate()
 
     def close(self) -> None:
         with self._lock:
@@ -107,7 +111,7 @@ class StateStore:
         with self._cursor() as cur:
             row = cur.execute(
                 "SELECT kind, item_id, change_token, external_key, "
-                "ironrag_document_id, last_pushed_at "
+                "ironrag_document_id, ironrag_library_id, last_pushed_at "
                 "FROM cursor WHERE kind = ? AND item_id = ?",
                 (kind, item_id),
             ).fetchone()
@@ -119,7 +123,7 @@ class StateStore:
         with self._cursor() as cur:
             row = cur.execute(
                 "SELECT kind, item_id, change_token, external_key, "
-                "ironrag_document_id, last_pushed_at "
+                "ironrag_document_id, ironrag_library_id, last_pushed_at "
                 "FROM cursor WHERE external_key = ?",
                 (external_key,),
             ).fetchone()
@@ -135,6 +139,7 @@ class StateStore:
         change_token: str | None,
         external_key: str,
         ironrag_document_id: str | None,
+        ironrag_library_id: str | None = None,
     ) -> None:
         now = datetime.now(tz=UTC).isoformat()
         with self._cursor() as cur:
@@ -142,14 +147,18 @@ class StateStore:
                 """
                 INSERT INTO cursor (
                     kind, item_id, change_token, external_key,
-                    ironrag_document_id, last_pushed_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    ironrag_document_id, ironrag_library_id, last_pushed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(kind, item_id) DO UPDATE SET
                     change_token = excluded.change_token,
                     external_key = excluded.external_key,
                     ironrag_document_id = COALESCE(
                         excluded.ironrag_document_id,
                         cursor.ironrag_document_id
+                    ),
+                    ironrag_library_id = COALESCE(
+                        excluded.ironrag_library_id,
+                        cursor.ironrag_library_id
                     ),
                     last_pushed_at = excluded.last_pushed_at
                 """,
@@ -159,6 +168,7 @@ class StateStore:
                     change_token,
                     external_key,
                     ironrag_document_id,
+                    ironrag_library_id,
                     now,
                 ),
             )
@@ -174,8 +184,15 @@ class StateStore:
         with self._cursor() as cur:
             rows = cur.execute(
                 "SELECT kind, item_id, change_token, external_key, "
-                "ironrag_document_id, last_pushed_at "
+                "ironrag_document_id, ironrag_library_id, last_pushed_at "
                 "FROM cursor WHERE kind = ?",
                 (kind,),
             ).fetchall()
         return [CursorRow(*r) for r in rows]
+
+    def _migrate(self) -> None:
+        """Add columns introduced after early cursor databases were created."""
+        with self._cursor() as cur:
+            columns = {row[1] for row in cur.execute("PRAGMA table_info(cursor)")}
+            if "ironrag_library_id" not in columns:
+                cur.execute("ALTER TABLE cursor ADD COLUMN ironrag_library_id TEXT")

@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.0.5 — 2026-06-18
+
+- Fixed orphan reaping against cursor-paginated IronRAG document lists.
+  `IronRagClient.list_documents_by_external_key_prefix` now follows
+  `nextCursor` / `next_cursor` pages before returning the prefix set that
+  `SyncManager` compares with the latest clean source enumeration. When a
+  connector rule changes, or a source item disappears, documents outside the
+  new `iter_items()` result are now considered by the reaper across the full
+  library rather than only the first page.
+- Cursor rows now remember the IronRAG library that owns their document id.
+  The orchestrator trusts a cached document id only when it belongs to the
+  currently resolved route, and the reaper also scans previously routed
+  libraries from the cursor snapshot. This lets routing-target changes move a
+  still-existing item to its new library and delete the old target document
+  during the same clean sweep.
+- Preserved the existing fallback paths: if `externalKeyPrefix` is rejected
+  by the backend, the client scans pages without the server-side prefix and
+  filters client-side; legacy `total` + `offset` pagination still works.
+- Existing SQLite cursor databases are migrated in place with the new nullable
+  `ironrag_library_id` column. Legacy rows that already have an
+  `ironrag_document_id` are backfilled from IronRAG document detail before the
+  cursor is trusted; if the owning library cannot be proven, the connector
+  refuses to upload a possible duplicate and reports the item visibly.
+- Deferred replace attempts when IronRAG reports a document is still processing
+  a previous mutation. The connector now leaves the cursor on the previous
+  `change_token` and retries on the next sweep instead of failing the item and
+  leaving the whole sync report red for a transient backend state.
+- Added the package `py.typed` marker so downstream connectors can type-check
+  against `ironrag_connector` without treating the SDK as `Any`.
+- Bumped the package version to 0.0.5.
+
 ## 0.0.4 — 2026-06-10
 
 - Dependents (a page's attachments and inline images, emitted via

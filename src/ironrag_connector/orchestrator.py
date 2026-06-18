@@ -24,14 +24,14 @@ Dispatch flow per item
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import (
     Any,
     Literal,
 )
 from uuid import UUID, uuid4
 
-from .ironrag import IronRagClient, IronRagError
+from .ironrag import IronRagClient, IronRagError, document_library_id
 from .observability import get_logger
 from .policy import (
     DeleteAction,
@@ -42,7 +42,7 @@ from .policy import (
 )
 from .routing import PolicyOverrides, ResolvedRoute, Router, RoutingError
 from .source import SourceAdapter, SourceItem, SourceItemRef
-from .state import StateStore
+from .state import CursorRow, StateStore
 
 log = get_logger(__name__)
 
@@ -117,7 +117,7 @@ class Orchestrator:
         # multiple parents in one sweep — without this every shared
         # image triggers a "same idempotency key used for a different
         # mutation request" 409 from IronRAG.
-        self._sweep_pushed: dict[str, str | None] = {}
+        self._sweep_pushed: dict[tuple[UUID, str], str | None] = {}
 
     def reset_sweep_cache(self) -> None:
         self._sweep_pushed.clear()
@@ -145,7 +145,9 @@ class Orchestrator:
 
         policy = self._policies.for_kind(ref.kind)
 
-        cursor = self._state.get(ref.kind, ref.item_id)
+        cursor = await self._resolve_cursor_library(
+            self._state.get(ref.kind, ref.item_id)
+        )
         if (
             cursor is not None
             and cursor.change_token is not None
@@ -156,7 +158,7 @@ class Orchestrator:
             # id from cursor, trust it (saves an HTTP call and dodges the
             # IronRAG list-endpoint externalKey gap). Otherwise fall back
             # to a server lookup to confirm the doc still exists.
-            if cursor.ironrag_document_id:
+            if cursor.ironrag_document_id and _cursor_matches_route(cursor, route):
                 return OrchestrationOutcome(
                     ref=ref,
                     action="noop_unchanged",
@@ -186,6 +188,7 @@ class Orchestrator:
                     change_token=ref.change_token,
                     external_key=ref.external_key,
                     ironrag_document_id=doc_id,
+                    ironrag_library_id=str(route.library_id),
                 )
                 return OrchestrationOutcome(
                     ref=ref,
@@ -198,6 +201,12 @@ class Orchestrator:
                         f"change_token unchanged ({ref.change_token}); "
                         "server confirms document present"
                     ),
+                )
+            if _cursor_ownership_unknown(cursor):
+                raise IronRagError(
+                    "legacy cursor has a document id, but IronRAG did not expose "
+                    f"its owning library for {ref.external_key}; refusing to upload "
+                    "a possible duplicate"
                 )
 
         item = await self._adapter.fetch(ref)
@@ -263,8 +272,9 @@ class Orchestrator:
         policy: PushPolicy,
         parent_external_key: str | None = None,
     ) -> OrchestrationOutcome:
-        if item.ref.external_key in self._sweep_pushed:
-            cached_doc_id = self._sweep_pushed[item.ref.external_key]
+        cache_key = (route.library_id, item.ref.external_key)
+        if cache_key in self._sweep_pushed:
+            cached_doc_id = self._sweep_pushed[cache_key]
             return _outcome(
                 item.ref,
                 route,
@@ -290,8 +300,14 @@ class Orchestrator:
         # already?" — the IronRAG list endpoint does not expose externalKey on
         # every deployment, so trusting find blindly would let us re-upload an
         # existing doc and trigger a unique-violation 500.
-        cursor = self._state.get(item.ref.kind, item.ref.item_id)
-        if cursor is not None and cursor.ironrag_document_id:
+        cursor = await self._resolve_cursor_library(
+            self._state.get(item.ref.kind, item.ref.item_id)
+        )
+        if (
+            cursor is not None
+            and cursor.ironrag_document_id
+            and _cursor_matches_route(cursor, route)
+        ):
             existing: dict[str, Any] | None = {"id": cursor.ironrag_document_id}
         else:
             existing = await self._ironrag.find_document_by_external_key(
@@ -299,6 +315,12 @@ class Orchestrator:
             )
 
         if existing is None:
+            if _cursor_ownership_unknown(cursor):
+                raise IronRagError(
+                    "legacy cursor has a document id, but IronRAG did not expose "
+                    f"its owning library for {item.ref.external_key}; refusing to "
+                    "upload a possible duplicate"
+                )
             if policy.on_new is UpsertAction.SKIP:
                 return _outcome(item.ref, route, "skipped_new", None, "policy on_new=skip")
             try:
@@ -335,8 +357,9 @@ class Orchestrator:
                     change_token=item.ref.change_token,
                     external_key=item.ref.external_key,
                     ironrag_document_id=existing_id,
+                    ironrag_library_id=str(route.library_id),
                 )
-                self._sweep_pushed[item.ref.external_key] = existing_id
+                self._sweep_pushed[cache_key] = existing_id
                 return _outcome(
                     item.ref,
                     route,
@@ -357,8 +380,9 @@ class Orchestrator:
                 change_token=item.ref.change_token,
                 external_key=item.ref.external_key,
                 ironrag_document_id=new_id,
+                ironrag_library_id=str(route.library_id),
             )
-            self._sweep_pushed[item.ref.external_key] = new_id
+            self._sweep_pushed[cache_key] = new_id
             return _outcome(
                 item.ref,
                 route,
@@ -374,8 +398,9 @@ class Orchestrator:
                 change_token=item.ref.change_token,
                 external_key=item.ref.external_key,
                 ironrag_document_id=str(existing.get("id")),
+                ironrag_library_id=str(route.library_id),
             )
-            self._sweep_pushed[item.ref.external_key] = str(existing.get("id"))
+            self._sweep_pushed[cache_key] = str(existing.get("id"))
             return _outcome(
                 item.ref,
                 route,
@@ -385,15 +410,33 @@ class Orchestrator:
             )
 
         document_id = existing["id"]
-        result = await self._ironrag.replace_document(
-            document_id=document_id,
-            file_bytes=item.payload,
-            file_name=item.file_name,
-            mime_type=item.mime_type,
-            idempotency_key=replace_key,
-            document_hint=item.document_hint,
-        )
-        if result is None:
+        try:
+            replace_result = await self._ironrag.replace_document(
+                document_id=document_id,
+                file_bytes=item.payload,
+                file_name=item.file_name,
+                mime_type=item.mime_type,
+                idempotency_key=replace_key,
+                document_hint=item.document_hint,
+            )
+        except IronRagError as exc:
+            if _is_conflicting_mutation(exc):
+                log.info(
+                    "orchestrator.replace_deferred",
+                    external_key=item.ref.external_key,
+                    document_id=str(document_id),
+                    reason="conflicting_mutation",
+                )
+                self._sweep_pushed[cache_key] = str(document_id)
+                return _outcome(
+                    item.ref,
+                    route,
+                    "skipped_changed",
+                    str(document_id),
+                    "document has a pending mutation; retry next sweep",
+                )
+            raise
+        if replace_result is None:
             # Cursor pointed at a doc IronRAG no longer has (manual delete,
             # library reset). Invalidate the cursor and fall back to upload
             # so the next sweep is consistent.
@@ -426,8 +469,9 @@ class Orchestrator:
                 change_token=item.ref.change_token,
                 external_key=item.ref.external_key,
                 ironrag_document_id=new_id,
+                ironrag_library_id=str(route.library_id),
             )
-            self._sweep_pushed[item.ref.external_key] = new_id
+            self._sweep_pushed[cache_key] = new_id
             return _outcome(
                 item.ref,
                 route,
@@ -441,8 +485,9 @@ class Orchestrator:
             change_token=item.ref.change_token,
             external_key=item.ref.external_key,
             ironrag_document_id=str(document_id),
+            ironrag_library_id=str(route.library_id),
         )
-        self._sweep_pushed[item.ref.external_key] = str(document_id)
+        self._sweep_pushed[cache_key] = str(document_id)
         return _outcome(
             item.ref,
             route,
@@ -467,10 +512,16 @@ class Orchestrator:
                 rule_description=None,
                 ironrag_document_id=ironrag_document_id,
                 detail=f"policy on_missing=ignore for kind={ref.kind}",
-            )
+        )
         idempotency_key = f"{self._adapter.name}:reap:{ref.kind}:{ref.item_id}:{uuid4()}"
         await self._ironrag.delete_document(ironrag_document_id, idempotency_key)
-        self._state.delete(ref.kind, ref.item_id)
+        cursor = self._state.get(ref.kind, ref.item_id)
+        if (
+            cursor is not None
+            and cursor.ironrag_document_id == ironrag_document_id
+            and cursor.ironrag_library_id == str(library_id)
+        ):
+            self._state.delete(ref.kind, ref.item_id)
         return OrchestrationOutcome(
             ref=ref,
             action="deleted",
@@ -516,6 +567,32 @@ class Orchestrator:
         policy = self._policies.for_kind(ref.kind)
         return await self.reap_orphan(ref, route.library_id, str(existing["id"]), policy)
 
+    async def _resolve_cursor_library(self, cursor: CursorRow | None) -> CursorRow | None:
+        if cursor is None or cursor.ironrag_library_id or not cursor.ironrag_document_id:
+            return cursor
+        document = await self._ironrag.get_document(cursor.ironrag_document_id)
+        if document is None:
+            self._state.delete(cursor.kind, cursor.item_id)
+            return None
+        library_id = document_library_id(document)
+        if library_id is None:
+            log.warning(
+                "orchestrator.cursor_library_unknown",
+                kind=cursor.kind,
+                item_id=cursor.item_id,
+                document_id=cursor.ironrag_document_id,
+            )
+            return cursor
+        self._state.upsert(
+            kind=cursor.kind,
+            item_id=cursor.item_id,
+            change_token=cursor.change_token,
+            external_key=cursor.external_key,
+            ironrag_document_id=cursor.ironrag_document_id,
+            ironrag_library_id=library_id,
+        )
+        return replace(cursor, ironrag_library_id=library_id)
+
 
 def _outcome(
     ref: SourceItemRef,
@@ -533,3 +610,16 @@ def _outcome(
         ironrag_document_id=document_id,
         detail=detail,
     )
+
+
+def _cursor_matches_route(cursor: CursorRow, route: ResolvedRoute) -> bool:
+    return cursor.ironrag_library_id == str(route.library_id)
+
+
+def _cursor_ownership_unknown(cursor: CursorRow | None) -> bool:
+    return bool(cursor and cursor.ironrag_document_id and cursor.ironrag_library_id is None)
+
+
+def _is_conflicting_mutation(exc: IronRagError) -> bool:
+    text = str(exc).lower()
+    return "conflicting_mutation" in text or "still processing a previous mutation" in text

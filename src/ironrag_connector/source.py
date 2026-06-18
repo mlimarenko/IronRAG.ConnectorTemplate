@@ -127,7 +127,7 @@ class SourceAdapter(Protocol):
         parents are collected on the next sweep.
         """
         if False:  # pragma: no cover — type-only yield
-            yield  # type: ignore[unreachable]
+            yield
 
     async def fetch(self, ref: SourceItemRef) -> SourceItem | None:
         """Materialize the full payload for ``ref``.

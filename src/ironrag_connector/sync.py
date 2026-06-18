@@ -7,10 +7,10 @@ The sync loop is the framework's heartbeat. Each pass:
    handles fetch + policy + push. Concurrency is bounded by
    ``sync_concurrency``.
 3. After the enumeration completes successfully, runs the orphan reaper:
-   for every ``kind`` the adapter declares, lists IronRAG documents
-   under the adapter's external-key prefix and deletes any whose item is
-   no longer in the cursor — *or* whose item is in the cursor but was
-   not seen in this sweep, depending on policy.
+   for every primary ``kind`` the adapter declares, lists IronRAG
+   documents under the adapter's external-key prefix and deletes any
+   whose item was not seen in this sweep, or whose item was routed to a
+   different library in this sweep, depending on policy.
 
 The reaper is gated on a clean enumeration: a partial sweep would falsely
 delete every item that did not happen to be listed before the network
@@ -23,8 +23,9 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+from uuid import UUID
 
-from .ironrag import IronRagClient, IronRagError
+from .ironrag import IronRagClient, IronRagError, document_library_id
 from .observability import get_logger
 from .orchestrator import OrchestrationOutcome, Orchestrator
 from .policy import DeleteAction
@@ -103,6 +104,8 @@ class SyncManager:
 
         sem = asyncio.Semaphore(self._concurrency)
         seen: dict[str, set[str]] = {k: set() for k in self._adapter.kinds}
+        seen_targets: dict[tuple[str, str], set[UUID]] = {}
+        cursor_libraries = await self._cursor_libraries_by_kind()
         tasks: list[asyncio.Task[None]] = []
 
         async def process(ref: Any) -> None:
@@ -123,10 +126,12 @@ class SyncManager:
                     )
                     report.errors += 1
                     return
+            _record_seen_target(seen_targets, outcome)
             _log_outcome(outcome)
             _tally(report, outcome)
             for dep in outcome.dependent_outcomes:
                 seen.setdefault(dep.ref.kind, set()).add(dep.ref.item_id)
+                _record_seen_target(seen_targets, dep)
                 _log_outcome(dep)
                 _tally(report, dep)
 
@@ -145,7 +150,7 @@ class SyncManager:
             report.errors += 1
 
         if sweep_completed:
-            await self._reap(seen, report)
+            await self._reap(seen, seen_targets, cursor_libraries, report)
 
         report.finished_at = datetime.now(tz=UTC)
         log.info(
@@ -159,7 +164,13 @@ class SyncManager:
         )
         return report
 
-    async def _reap(self, seen: dict[str, set[str]], report: SyncReport) -> None:
+    async def _reap(
+        self,
+        seen: dict[str, set[str]],
+        seen_targets: dict[tuple[str, str], set[UUID]],
+        cursor_libraries: dict[str, set[UUID]],
+        report: SyncReport,
+    ) -> None:
         """Delete IronRAG docs whose source item vanished.
 
         Only ``primary_kinds`` are reaped — kinds enumerated directly by
@@ -167,7 +178,7 @@ class SyncManager:
         participate because their absence from ``seen`` may simply mean
         the parent noop'd and we didn't re-fetch.
         """
-        target_libs = self._router.target_libraries()
+        current_target_libs = self._router.target_libraries()
         primary = getattr(self._adapter, "primary_kinds", self._adapter.kinds)
         for kind in primary:
             policy = self._policies.for_kind(kind)
@@ -176,6 +187,7 @@ class SyncManager:
             prefix = self._adapter.external_key(kind, "")
             if not prefix.endswith(":"):
                 prefix = prefix + ""  # adapter may already include trailing colon
+            target_libs = current_target_libs | cursor_libraries.get(kind, set())
             for library_id in target_libs:
                 try:
                     pairs = await self._ironrag.list_documents_by_external_key_prefix(
@@ -196,9 +208,10 @@ class SyncManager:
                     parsed_kind, parsed_item_id = parsed
                     if parsed_kind != kind:
                         continue
-                    if parsed_item_id in seen.get(kind, set()):
+                    if _document_still_expected(
+                        kind, parsed_item_id, library_id, seen, seen_targets
+                    ):
                         continue
-                    cursor = self._state.get_by_external_key(external_key)
                     from .source import SourceItemRef
 
                     reap_ref = SourceItemRef(
@@ -211,8 +224,6 @@ class SyncManager:
                             reap_ref, library_id, document_id, policy
                         )
                         report.reaped += 1
-                        if cursor is not None:
-                            self._state.delete(cursor.kind, cursor.item_id)
                     except IronRagError as exc:
                         log.warning(
                             "sync.reap.delete_error",
@@ -221,6 +232,58 @@ class SyncManager:
                             error=str(exc),
                         )
                         report.errors += 1
+
+    async def _cursor_libraries_by_kind(self) -> dict[str, set[UUID]]:
+        libraries: dict[str, set[UUID]] = {}
+        primary = getattr(self._adapter, "primary_kinds", self._adapter.kinds)
+        for kind in primary:
+            for row in self._state.items_of_kind(kind):
+                library_id_raw = row.ironrag_library_id
+                if library_id_raw is None and row.ironrag_document_id:
+                    try:
+                        document = await self._ironrag.get_document(row.ironrag_document_id)
+                    except IronRagError as exc:
+                        log.warning(
+                            "sync.reap.cursor_library_lookup_error",
+                            kind=row.kind,
+                            item_id=row.item_id,
+                            document_id=row.ironrag_document_id,
+                            error=str(exc),
+                        )
+                        continue
+                    if document is None:
+                        self._state.delete(row.kind, row.item_id)
+                        continue
+                    library_id_raw = document_library_id(document)
+                    if library_id_raw is None:
+                        log.warning(
+                            "sync.reap.cursor_library_unknown",
+                            kind=row.kind,
+                            item_id=row.item_id,
+                            document_id=row.ironrag_document_id,
+                        )
+                        continue
+                    self._state.upsert(
+                        kind=row.kind,
+                        item_id=row.item_id,
+                        change_token=row.change_token,
+                        external_key=row.external_key,
+                        ironrag_document_id=row.ironrag_document_id,
+                        ironrag_library_id=library_id_raw,
+                    )
+                if not library_id_raw:
+                    continue
+                try:
+                    library_id = UUID(library_id_raw)
+                except ValueError:
+                    log.warning(
+                        "sync.reap.invalid_cursor_library",
+                        kind=row.kind,
+                        item_id=row.item_id,
+                    )
+                    continue
+                libraries.setdefault(kind, set()).add(library_id)
+        return libraries
 
     async def run_forever(self, cancel_event: asyncio.Event) -> None:
         while True:
@@ -252,6 +315,36 @@ def _log_outcome(outcome: OrchestrationOutcome) -> None:
         title=(outcome.ref.raw or {}).get("name")
         or (outcome.ref.raw or {}).get("title"),
     )
+
+
+def _record_seen_target(
+    seen_targets: dict[tuple[str, str], set[UUID]], outcome: OrchestrationOutcome
+) -> None:
+    if outcome.library_id is None:
+        return
+    if outcome.action in {"unrouted", "fetch_returned_none", "skipped_missing", "deleted"}:
+        return
+    seen_targets.setdefault((outcome.ref.kind, outcome.ref.item_id), set()).add(
+        outcome.library_id
+    )
+
+
+def _document_still_expected(
+    kind: str,
+    item_id: str,
+    library_id: UUID,
+    seen: dict[str, set[str]],
+    seen_targets: dict[tuple[str, str], set[UUID]],
+) -> bool:
+    if item_id not in seen.get(kind, set()):
+        return False
+    expected_libraries = seen_targets.get((kind, item_id), set())
+    if not expected_libraries:
+        # The source item was enumerated, but no successful route/push target
+        # was established in this sweep. Keep existing documents rather than
+        # turning transient fetch/routing failures into destructive deletes.
+        return True
+    return library_id in expected_libraries
 
 
 def _tally(report: SyncReport, outcome: OrchestrationOutcome) -> None:

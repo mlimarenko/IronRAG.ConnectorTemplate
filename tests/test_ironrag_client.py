@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from ironrag_connector.config import BaseConnectorSettings
-from ironrag_connector.ironrag import IronRagClient
+from ironrag_connector.ironrag import IronRagClient, document_library_id
 
 LIB = UUID("00000000-0000-0000-0000-000000000000")
 
@@ -95,6 +95,140 @@ async def test_find_returns_none_when_absent() -> None:
     await client.aclose()
 
     assert found is None
+
+
+@pytest.mark.asyncio
+async def test_get_document_unwraps_document_envelope_and_library_id() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/content/documents/doc-1"
+        return httpx.Response(
+            200,
+            json={
+                "document": {
+                    "id": "doc-1",
+                    "externalKey": "source:page:1",
+                    "libraryId": str(LIB),
+                }
+            },
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    document = await client.get_document("doc-1")
+    await client.aclose()
+
+    assert document is not None
+    assert document["id"] == "doc-1"
+    assert document_library_id(document) == str(LIB)
+
+
+@pytest.mark.asyncio
+async def test_list_by_prefix_follows_cursor_pages() -> None:
+    requests: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.url.params.get("externalKeyPrefix") == "source:page:"
+        if len(requests) == 1:
+            assert request.url.params.get("cursor") is None
+            assert request.url.params.get("offset") is None
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {"id": "doc-1", "externalKey": "source:page:1"},
+                        {"id": "foreign", "externalKey": "other:page:1"},
+                    ],
+                    "nextCursor": "next-page",
+                },
+            )
+        assert request.url.params.get("cursor") == "next-page"
+        assert request.url.params.get("offset") is None
+        return httpx.Response(
+            200,
+            json={
+                "items": [{"id": "doc-2", "externalKey": "source:page:2"}],
+                "nextCursor": None,
+            },
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    pairs = await client.list_documents_by_external_key_prefix(
+        LIB, "source:page:", page_size=2
+    )
+    await client.aclose()
+
+    assert pairs == [("source:page:1", "doc-1"), ("source:page:2", "doc-2")]
+    assert len(requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_list_by_prefix_falls_back_when_server_prefix_is_rejected() -> None:
+    requests: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            assert request.url.params.get("externalKeyPrefix") == "source:page:"
+            return httpx.Response(422, json={"error": "unsupported filter"})
+        assert request.url.params.get("externalKeyPrefix") is None
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {"id": "doc-1", "externalKey": "source:page:1"},
+                    {"id": "foreign", "externalKey": "other:page:1"},
+                ],
+                "nextCursor": None,
+            },
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    pairs = await client.list_documents_by_external_key_prefix(LIB, "source:page:")
+    await client.aclose()
+
+    assert pairs == [("source:page:1", "doc-1")]
+    assert len(requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_list_by_prefix_supports_legacy_offset_total_pages() -> None:
+    requests: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        offset = request.url.params.get("offset")
+        if offset is None:
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {"id": "doc-1", "externalKey": "source:page:1"},
+                        {"id": "doc-2", "externalKey": "source:page:2"},
+                    ],
+                    "total": 3,
+                },
+            )
+        assert offset == "2"
+        return httpx.Response(
+            200,
+            json={
+                "items": [{"id": "doc-3", "externalKey": "source:page:3"}],
+                "total": 3,
+            },
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    pairs = await client.list_documents_by_external_key_prefix(
+        LIB, "source:page:", page_size=2
+    )
+    await client.aclose()
+
+    assert pairs == [
+        ("source:page:1", "doc-1"),
+        ("source:page:2", "doc-2"),
+        ("source:page:3", "doc-3"),
+    ]
+    assert len(requests) == 2
 
 
 @pytest.mark.asyncio

@@ -31,6 +31,7 @@ The orchestrator detects ``duplicate_of_existing=True`` and applies the
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from typing import Any
 from uuid import UUID
 
@@ -197,7 +198,7 @@ class IronRagClient:
             raise IronRagError(
                 f"IronRAG upload → {response.status_code}: {response.text[:400]}"
             )
-        return response.json()
+        return _json_object(response)
 
     async def replace_document(
         self,
@@ -225,7 +226,21 @@ class IronRagClient:
             raise IronRagError(
                 f"IronRAG replace → {response.status_code}: {response.text[:400]}"
             )
-        return response.json()
+        return _json_object(response)
+
+    async def get_document(self, document_id: UUID | str) -> dict[str, Any] | None:
+        response = await self._client.get(f"/v1/content/documents/{document_id}")
+        if response.status_code in (404, 410):
+            return None
+        if response.status_code >= 400:
+            raise IronRagError(
+                f"IronRAG get document → {response.status_code}: {response.text[:400]}"
+            )
+        payload = _json_object(response)
+        document = payload.get("document") or payload
+        if not isinstance(document, dict):
+            raise IronRagError("IronRAG document response was not a JSON object")
+        return document
 
     async def list_documents_by_external_key_prefix(
         self,
@@ -235,15 +250,20 @@ class IronRagClient:
         page_size: int = 200,
     ) -> list[tuple[str, str]]:
         results: list[tuple[str, str]] = []
+        cursor: str | None = None
         offset = 0
+        use_offset = False
         server_filter_supported: bool | None = None
 
         while True:
             params: dict[str, str | int] = {
                 "libraryId": str(library_id),
                 "limit": page_size,
-                "offset": offset,
             }
+            if cursor:
+                params["cursor"] = cursor
+            elif use_offset or offset:
+                params["offset"] = offset
             if server_filter_supported is not False:
                 params["externalKeyPrefix"] = prefix
 
@@ -251,6 +271,9 @@ class IronRagClient:
 
             if response.status_code in (400, 422) and server_filter_supported is None:
                 server_filter_supported = False
+                cursor = None
+                offset = 0
+                use_offset = False
                 continue
 
             if server_filter_supported is not False:
@@ -274,10 +297,24 @@ class IronRagClient:
                 if key.startswith(prefix) and doc_id:
                     results.append((key, str(doc_id)))
 
-            total = payload.get("total", offset + len(items))
-            offset += page_size
-            if offset >= total or not items:
+            next_cursor = payload.get("nextCursor") or payload.get("next_cursor")
+            if next_cursor:
+                cursor = str(next_cursor)
+                use_offset = False
+                continue
+
+            total = _optional_int(payload.get("total"))
+            if total is not None:
+                offset += len(items)
+                if not items or offset >= total:
+                    break
+                cursor = None
+                use_offset = True
+                continue
+
+            if not items:
                 break
+            break
 
         return results
 
@@ -294,3 +331,36 @@ class IronRagClient:
         raise IronRagError(
             f"IronRAG delete → {response.status_code}: {response.text[:400]}"
         )
+
+
+def _optional_int(value: object) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _json_object(response: httpx.Response) -> dict[str, Any]:
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise IronRagError("IronRAG response was not a JSON object")
+    return payload
+
+
+def document_library_id(document: Mapping[str, Any]) -> str | None:
+    for key in ("libraryId", "library_id", "libraryID"):
+        value = document.get(key)
+        if value:
+            return str(value)
+    library = document.get("library")
+    if isinstance(library, Mapping):
+        value = library.get("id")
+        if value:
+            return str(value)
+    return None
