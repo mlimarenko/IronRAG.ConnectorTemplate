@@ -77,6 +77,12 @@ class BaseConnectorSettings(BaseSettings):
     ironrag_base_url: str
     ironrag_api_token: str
     request_timeout_seconds: float = Field(60.0, ge=1.0)
+    cursor_library_lookup_timeout_seconds: float = Field(default=5.0, ge=0.1)
+    """Timeout for best-effort legacy cursor library lookups.
+
+    Keep this separate from ``request_timeout_seconds``: uploads may need a
+    generous timeout, but one metadata lookup must not block a whole sweep.
+    """
 
     # --- Routing ---
     routing_config_path: Path = Field(default=Path("routing.yaml"))

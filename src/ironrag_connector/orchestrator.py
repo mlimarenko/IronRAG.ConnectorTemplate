@@ -23,6 +23,7 @@ Dispatch flow per item
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from dataclasses import dataclass, field, replace
 from typing import (
@@ -30,6 +31,8 @@ from typing import (
     Literal,
 )
 from uuid import UUID, uuid4
+
+import httpx
 
 from .ironrag import IronRagClient, IronRagError, document_library_id
 from .observability import get_logger
@@ -105,12 +108,14 @@ class Orchestrator:
         router: Router,
         state: StateStore,
         policies: PolicyOverrides,
+        cursor_library_lookup_timeout_seconds: float = 5.0,
     ) -> None:
         self._adapter = adapter
         self._ironrag = ironrag
         self._router = router
         self._state = state
         self._policies = policies
+        self._cursor_library_lookup_timeout = cursor_library_lookup_timeout_seconds
         # In-sweep dedup: collapses repeated push_item calls for the
         # same external_key down to one IronRAG mutation. Necessary
         # because dependents (images, attachments) can be reached from
@@ -570,7 +575,28 @@ class Orchestrator:
     async def _resolve_cursor_library(self, cursor: CursorRow | None) -> CursorRow | None:
         if cursor is None or cursor.ironrag_library_id or not cursor.ironrag_document_id:
             return cursor
-        document = await self._ironrag.get_document(cursor.ironrag_document_id)
+        try:
+            async with asyncio.timeout(self._cursor_library_lookup_timeout):
+                document = await self._ironrag.get_document(cursor.ironrag_document_id)
+        except TimeoutError:
+            log.warning(
+                "orchestrator.cursor_library_lookup_timeout",
+                kind=cursor.kind,
+                item_id=cursor.item_id,
+                document_id=cursor.ironrag_document_id,
+                timeout_seconds=self._cursor_library_lookup_timeout,
+            )
+            return cursor
+        except (IronRagError, httpx.TransportError) as exc:
+            log.warning(
+                "orchestrator.cursor_library_lookup_error",
+                kind=cursor.kind,
+                item_id=cursor.item_id,
+                document_id=cursor.ironrag_document_id,
+                error_type=type(exc).__name__,
+                error=str(exc) or repr(exc),
+            )
+            return cursor
         if document is None:
             self._state.delete(cursor.kind, cursor.item_id)
             return None

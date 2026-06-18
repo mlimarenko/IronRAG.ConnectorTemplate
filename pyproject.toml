@@ -1,6 +1,6 @@
 [project]
 name = "ironrag-connector"
-version = "0.0.5"
+version = "0.0.6"
 description = "Framework for building data-source connectors that push content into IronRAG."
 readme = "README.md"
 requires-python = ">=3.12"

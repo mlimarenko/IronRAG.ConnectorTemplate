@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.0.6 — 2026-06-18
+
+- Made legacy cursor library backfill bounded and non-fatal. A sweep now
+  resolves old cursor rows with a short per-document timeout and limited
+  concurrency instead of letting a single slow document-detail request block
+  `/sync/run` before source enumeration starts.
+- Added `CURSOR_LIBRARY_LOOKUP_TIMEOUT_SECONDS` so operators can tune that
+  metadata backfill independently from large upload/replace request timeouts.
+- Defined the degraded reaper contract for unresolved legacy cursor rows:
+  lookup failures skip destructive cleanup for unknown historical libraries in
+  that sweep, while per-item orchestration still refuses to upload a possible
+  duplicate until ownership is proven or the target-library lookup succeeds.
+- Added regression coverage for cursor lookup timeouts before enumeration,
+  partial reaper scans, duplicate-prevention on unresolved legacy cursors, and
+  the existing fast route-move cleanup path.
+- Bumped the package version to 0.0.6.
+
 ## 0.0.5 — 2026-06-18
 
 - Fixed orphan reaping against cursor-paginated IronRAG document lists.

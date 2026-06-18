@@ -104,6 +104,9 @@ def build_app(
         router=router,
         state=state,
         policies=policies,
+        cursor_library_lookup_timeout_seconds=(
+            settings.cursor_library_lookup_timeout_seconds
+        ),
     )
     sync_manager = SyncManager(
         adapter=adapter,
@@ -114,6 +117,9 @@ def build_app(
         policies=policies,
         concurrency=settings.sync_concurrency,
         interval_seconds=settings.sync_interval_seconds,
+        cursor_library_lookup_timeout_seconds=(
+            settings.cursor_library_lookup_timeout_seconds
+        ),
     )
 
     pidfile_path = settings.pidfile_path or Path(

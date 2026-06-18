@@ -25,6 +25,8 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
+import httpx
+
 from .ironrag import IronRagClient, IronRagError, document_library_id
 from .observability import get_logger
 from .orchestrator import OrchestrationOutcome, Orchestrator
@@ -83,6 +85,7 @@ class SyncManager:
         policies: PolicyOverrides,
         concurrency: int,
         interval_seconds: int,
+        cursor_library_lookup_timeout_seconds: float = 5.0,
     ) -> None:
         self._adapter = adapter
         self._ironrag = ironrag
@@ -92,6 +95,7 @@ class SyncManager:
         self._policies = policies
         self._concurrency = concurrency
         self._interval = interval_seconds
+        self._cursor_library_lookup_timeout = cursor_library_lookup_timeout_seconds
 
     async def run_once(self, *, reason: str) -> SyncReport:
         started = datetime.now(tz=UTC)
@@ -236,53 +240,80 @@ class SyncManager:
     async def _cursor_libraries_by_kind(self) -> dict[str, set[UUID]]:
         libraries: dict[str, set[UUID]] = {}
         primary = getattr(self._adapter, "primary_kinds", self._adapter.kinds)
-        for kind in primary:
-            for row in self._state.items_of_kind(kind):
-                library_id_raw = row.ironrag_library_id
-                if library_id_raw is None and row.ironrag_document_id:
-                    try:
-                        document = await self._ironrag.get_document(row.ironrag_document_id)
-                    except IronRagError as exc:
-                        log.warning(
-                            "sync.reap.cursor_library_lookup_error",
-                            kind=row.kind,
-                            item_id=row.item_id,
-                            document_id=row.ironrag_document_id,
-                            error=str(exc),
-                        )
-                        continue
-                    if document is None:
-                        self._state.delete(row.kind, row.item_id)
-                        continue
-                    library_id_raw = document_library_id(document)
-                    if library_id_raw is None:
-                        log.warning(
-                            "sync.reap.cursor_library_unknown",
-                            kind=row.kind,
-                            item_id=row.item_id,
-                            document_id=row.ironrag_document_id,
-                        )
-                        continue
-                    self._state.upsert(
-                        kind=row.kind,
-                        item_id=row.item_id,
-                        change_token=row.change_token,
-                        external_key=row.external_key,
-                        ironrag_document_id=row.ironrag_document_id,
-                        ironrag_library_id=library_id_raw,
-                    )
-                if not library_id_raw:
-                    continue
+        lookup_sem = asyncio.Semaphore(max(1, min(self._concurrency, 8)))
+
+        async def resolve_row(row: Any) -> tuple[str, UUID] | None:
+            library_id_raw = row.ironrag_library_id
+            if library_id_raw is None and row.ironrag_document_id:
                 try:
-                    library_id = UUID(library_id_raw)
-                except ValueError:
+                    async with lookup_sem:
+                        async with asyncio.timeout(self._cursor_library_lookup_timeout):
+                            document = await self._ironrag.get_document(
+                                row.ironrag_document_id
+                            )
+                except TimeoutError:
                     log.warning(
-                        "sync.reap.invalid_cursor_library",
+                        "sync.reap.cursor_library_lookup_timeout",
                         kind=row.kind,
                         item_id=row.item_id,
+                        document_id=row.ironrag_document_id,
+                        timeout_seconds=self._cursor_library_lookup_timeout,
                     )
+                    return None
+                except (IronRagError, httpx.TransportError) as exc:
+                    log.warning(
+                        "sync.reap.cursor_library_lookup_error",
+                        kind=row.kind,
+                        item_id=row.item_id,
+                        document_id=row.ironrag_document_id,
+                        error_type=type(exc).__name__,
+                        error=str(exc) or repr(exc),
+                    )
+                    return None
+                if document is None:
+                    self._state.delete(row.kind, row.item_id)
+                    return None
+                library_id_raw = document_library_id(document)
+                if library_id_raw is None:
+                    log.warning(
+                        "sync.reap.cursor_library_unknown",
+                        kind=row.kind,
+                        item_id=row.item_id,
+                        document_id=row.ironrag_document_id,
+                    )
+                    return None
+                self._state.upsert(
+                    kind=row.kind,
+                    item_id=row.item_id,
+                    change_token=row.change_token,
+                    external_key=row.external_key,
+                    ironrag_document_id=row.ironrag_document_id,
+                    ironrag_library_id=library_id_raw,
+                )
+            if not library_id_raw:
+                return None
+            try:
+                return row.kind, UUID(library_id_raw)
+            except ValueError:
+                log.warning(
+                    "sync.reap.invalid_cursor_library",
+                    kind=row.kind,
+                    item_id=row.item_id,
+                    library_id=library_id_raw,
+                )
+                return None
+
+        for kind in primary:
+            rows = self._state.items_of_kind(kind)
+            results = await asyncio.gather(
+                *(resolve_row(row) for row in rows),
+                return_exceptions=False,
+            )
+            for result in results:
+                if result is None:
                     continue
-                libraries.setdefault(kind, set()).add(library_id)
+                result_kind, library_id = result
+                libraries.setdefault(result_kind, set()).add(library_id)
         return libraries
 
     async def run_forever(self, cancel_event: asyncio.Event) -> None:

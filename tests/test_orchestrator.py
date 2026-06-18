@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import httpx
 import pytest
 from echo_connector.adapter import EchoAdapter, EchoPage
 
@@ -28,6 +29,7 @@ from ironrag_connector.sync import SyncManager
 WS = UUID("00000000-0000-0000-0000-000000000099")
 LIB = UUID("00000000-0000-0000-0000-000000000000")
 LIB2 = UUID("00000000-0000-0000-0000-000000000002")
+LIB3 = UUID("00000000-0000-0000-0000-000000000003")
 
 
 class FakeIronRag:
@@ -554,6 +556,46 @@ async def test_legacy_cursor_unknown_library_blocks_possible_duplicate_upload(
 
 
 @pytest.mark.asyncio
+async def test_legacy_cursor_lookup_timeout_blocks_possible_duplicate_upload(
+    tmp_path: Path,
+) -> None:
+    adapter = EchoAdapter(
+        {"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t2")}
+    )
+    state = _state(tmp_path)
+    state.upsert(
+        kind="page",
+        item_id="1",
+        change_token="t1",
+        external_key="echo:page:1",
+        ironrag_document_id="doc-pre",
+    )
+
+    class BlindIronRag(FakeIronRag):
+        async def find_document_by_external_key(self, library_id, external_key):
+            return None
+
+        async def get_document(self, document_id: str) -> dict[str, Any] | None:
+            raise httpx.ReadTimeout("synthetic timeout")
+
+    ironrag = BlindIronRag()
+    orchestrator = Orchestrator(
+        adapter=adapter,
+        ironrag=ironrag,  # type: ignore[arg-type]
+        router=Router(_routing()),
+        state=state,
+        policies=_policies(),
+        cursor_library_lookup_timeout_seconds=0.01,
+    )
+
+    ref = await _first(adapter.iter_items())
+    with pytest.raises(IronRagError, match="refusing to upload"):
+        await orchestrator.push_ref(ref)
+
+    assert ironrag.uploads == []
+
+
+@pytest.mark.asyncio
 async def test_route_move_creates_new_target_and_reaps_old_target(tmp_path: Path) -> None:
     adapter = EchoAdapter(
         {"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t1")}
@@ -679,6 +721,128 @@ async def test_reap_respects_ignore_policy(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cursor_library_timeout_does_not_abort_sweep_before_enumeration(
+    tmp_path: Path,
+) -> None:
+    adapter = EchoAdapter(
+        {"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t1")}
+    )
+    state = _state(tmp_path)
+    external_key = "echo:page:1"
+    state.upsert(
+        kind="page",
+        item_id="1",
+        change_token="t1",
+        external_key=external_key,
+        ironrag_document_id="doc-pre",
+    )
+
+    class TimeoutBackfillIronRag(FakeIronRag):
+        async def get_document(self, document_id: str) -> dict[str, Any] | None:
+            raise httpx.ReadTimeout("synthetic timeout")
+
+    ironrag = TimeoutBackfillIronRag()
+    ironrag.documents[(LIB, external_key)] = {
+        "id": "doc-pre",
+        "externalKey": external_key,
+    }
+    router = Router(_routing())
+    orchestrator = Orchestrator(
+        adapter=adapter,
+        ironrag=ironrag,  # type: ignore[arg-type]
+        router=router,
+        state=state,
+        policies=_policies(),
+        cursor_library_lookup_timeout_seconds=0.01,
+    )
+    manager = SyncManager(
+        adapter=adapter,
+        ironrag=ironrag,  # type: ignore[arg-type]
+        orchestrator=orchestrator,
+        router=router,
+        state=state,
+        policies=_policies(),
+        concurrency=1,
+        interval_seconds=60,
+        cursor_library_lookup_timeout_seconds=0.01,
+    )
+
+    report = await manager.run_once(reason="test")
+
+    assert report.items_seen == 1
+    assert report.noop_unchanged == 1
+    assert report.errors == 0
+    row = state.get("page", "1")
+    assert row is not None
+    assert row.ironrag_library_id == str(LIB)
+
+
+@pytest.mark.asyncio
+async def test_reaper_uses_partial_cursor_libraries_without_false_delete(
+    tmp_path: Path,
+) -> None:
+    adapter = EchoAdapter({})
+    state = _state(tmp_path)
+    state.upsert(
+        kind="page",
+        item_id="known-old",
+        change_token="t1",
+        external_key="echo:page:known-old",
+        ironrag_document_id="doc-known",
+        ironrag_library_id=str(LIB),
+    )
+    state.upsert(
+        kind="page",
+        item_id="unknown-old",
+        change_token="t1",
+        external_key="echo:page:unknown-old",
+        ironrag_document_id="doc-unknown",
+    )
+
+    class PartialBackfillIronRag(FakeIronRag):
+        async def get_document(self, document_id: str) -> dict[str, Any] | None:
+            if document_id == "doc-unknown":
+                raise httpx.ReadTimeout("synthetic timeout")
+            return await super().get_document(document_id)
+
+    ironrag = PartialBackfillIronRag()
+    ironrag.documents[(LIB, "echo:page:known-old")] = {
+        "id": "doc-known",
+        "externalKey": "echo:page:known-old",
+    }
+    ironrag.documents[(LIB3, "echo:page:unknown-old")] = {
+        "id": "doc-unknown",
+        "externalKey": "echo:page:unknown-old",
+    }
+    router = Router(_routing_to(LIB2))
+    orchestrator = Orchestrator(
+        adapter=adapter,
+        ironrag=ironrag,  # type: ignore[arg-type]
+        router=router,
+        state=state,
+        policies=_policies(),
+    )
+    manager = SyncManager(
+        adapter=adapter,
+        ironrag=ironrag,  # type: ignore[arg-type]
+        orchestrator=orchestrator,
+        router=router,
+        state=state,
+        policies=_policies(),
+        concurrency=1,
+        interval_seconds=60,
+        cursor_library_lookup_timeout_seconds=0.01,
+    )
+
+    report = await manager.run_once(reason="test")
+
+    assert report.reaped == 1
+    assert report.errors == 0
+    assert (LIB, "echo:page:known-old") not in ironrag.documents
+    assert (LIB3, "echo:page:unknown-old") in ironrag.documents
+
+
+@pytest.mark.asyncio
 async def test_idempotency_key_is_content_addressed(tmp_path: Path) -> None:
     """The default idempotency key must derive from the payload bytes, not
     the change_token, so a re-rendered payload for the same logical version
@@ -760,7 +924,9 @@ async def test_noop_persists_doc_id_to_cursor(tmp_path: Path) -> None:
     assert out.action == "noop_unchanged"
     assert out.ironrag_document_id == "doc-pre"
     assert ironrag.find_calls == 1
-    assert state.get("page", "1").ironrag_document_id == "doc-pre"
+    row = state.get("page", "1")
+    assert row is not None
+    assert row.ironrag_document_id == "doc-pre"
 
     # Second sweep: cursor now knows the id, so no further find calls.
     out2 = await orchestrator.push_ref(ref)

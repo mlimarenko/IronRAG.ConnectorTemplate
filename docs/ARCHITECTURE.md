@@ -90,10 +90,14 @@ destructive deletes.
 
 Cursor databases created before `ironrag_library_id` existed are
 transitioned explicitly: when a row has an `ironrag_document_id` but no
-library id, the framework asks IronRAG for that document's detail and
-backfills the owning library before trusting the cached document id. If
-IronRAG cannot prove the ownership, the connector refuses to upload a
-possible duplicate instead of guessing.
+library id, the framework asks IronRAG for that document's detail with a
+bounded `CURSOR_LIBRARY_LOOKUP_TIMEOUT_SECONDS` timeout and backfills the
+owning library when it can. If that lookup times out or IronRAG cannot
+prove ownership, the sweep stays non-fatal and non-destructive for the
+unknown historical library; route-move cleanup for that unresolved row is
+deferred to a later sweep. The item path still refuses to upload a possible
+duplicate while ownership is unknown, so degraded backfill preserves
+duplicate-prevention over eager cleanup.
 
 ## Why a Protocol instead of inheritance
 
@@ -131,6 +135,7 @@ honest: every push decision is `(kind, item_id) → policy`.
 | `iter_items` raises mid-stream | Sweep aborts, reaper is **not** run (would falsely delete unseen items). Next sweep retries. |
 | `fetch` returns `None` | Outcome `fetch_returned_none`; no IronRAG call, no cursor update. Reaper will still delete the cursor row on the next clean sweep where the ref was missing. |
 | IronRAG 5xx | Raised as `IronRagError`; orchestrator surfaces in `sync.errors` and continues with the next item. |
+| Legacy cursor library lookup times out | Sweep continues with partial reaper coverage; unresolved historical libraries are not deleted in that sweep, and duplicate uploads remain blocked until ownership is known. |
 | IronRAG 409 duplicate | `on_duplicate_content` policy decides: silently dedupe (default) or raise. |
 | Vendor returns retry-able status (429 / 5xx) | The adapter's transport layer is responsible for retry-with-backoff. The framework does not retry on the vendor side; see `bookstack/src/bookstack_connector/bookstack.py:97` for a reference implementation. |
 | Two processes start with the same `STATE_DB_PATH` | The pidfile lock fails the second one loud. SQLite would otherwise handle the concurrency, but two parallel sweeps would burn vendor quota. |
