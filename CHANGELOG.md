@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.0.11 — 2026-06-18
+
+- Added routing config reload for sweeps and webhooks. When `routing.yaml`
+  changes, the framework reloads the existing router and policy table in place
+  before the next sync run or webhook mutation, so route and per-kind policy
+  updates converge without restarting the connector process.
+- Invalid or temporarily unavailable routing config keeps the previous valid
+  routing active and logs `routing.reload_error` instead of breaking an
+  otherwise healthy connector loop.
+- Added regression coverage for successful routing/policy reload, failed reload
+  keep-old behavior, and sync-manager reload invocation before a sweep.
+- Bumped the package version to 0.0.11.
+
 ## 0.0.10 — 2026-06-18
 
 - Added `IRONRAG_MUTATION_TIMEOUT_SECONDS` for upload/replace/delete admission

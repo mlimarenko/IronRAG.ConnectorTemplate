@@ -43,7 +43,7 @@ from .ironrag import IronRagClient
 from .observability import configure_logging, get_logger
 from .orchestrator import Orchestrator
 from .pidfile import PidfileLock
-from .routing import Router, load_routing_config
+from .routing import Router, RoutingReloader, load_routing_config
 from .source import SourceAdapter
 from .state import StateStore
 from .sync import SyncAlreadyRunningError, SyncManager
@@ -87,7 +87,14 @@ def build_app(
     configure_logging(settings.log_level)
     routing = load_routing_config(settings.routing_config_path)
     router = Router(routing)
-    policies = router.build_policies(PolicyDefaults().as_push_policy())
+    policy_defaults = PolicyDefaults().as_push_policy()
+    policies = router.build_policies(policy_defaults)
+    routing_reloader = RoutingReloader(
+        path=settings.routing_config_path,
+        router=router,
+        policies=policies,
+        defaults=policy_defaults,
+    )
     log.info(
         "routing.loaded",
         rules=len(routing.rules),
@@ -125,6 +132,7 @@ def build_app(
             settings.cursor_library_lookup_max_rows_per_sweep
         ),
         reaper_list_timeout_seconds=settings.reaper_list_timeout_seconds,
+        routing_reloader=routing_reloader,
     )
 
     pidfile_path = settings.pidfile_path or Path(
@@ -203,7 +211,7 @@ def build_app(
 
     if settings.run_mode is not RunMode.POLL:
         for handler in resolved_handlers:
-            _mount_webhook(app, settings, orchestrator, handler)
+            _mount_webhook(app, settings, orchestrator, handler, routing_reloader)
     elif resolved_handlers:
         log.info(
             "connector.webhook_handlers_ignored",
@@ -219,6 +227,7 @@ def _mount_webhook(
     settings: BaseConnectorSettings,
     orchestrator: Orchestrator,
     handler: WebhookHandler,
+    routing_reloader: RoutingReloader,
 ) -> None:
     name = handler.name
 
@@ -227,6 +236,7 @@ def _mount_webhook(
         _require_admin_bearer(settings, request)
         if handler.extra_auth is not None:
             handler.extra_auth(request, body)
+        routing_reloader.reload_if_changed()
         try:
             import json
 

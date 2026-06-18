@@ -24,6 +24,7 @@ from .routing import (
     Router,
     RoutingConfig,
     RoutingError,
+    RoutingReloader,
     load_routing_config,
 )
 from .seed import seed_cursor
@@ -46,6 +47,7 @@ __all__ = [
     "Router",
     "RoutingConfig",
     "RoutingError",
+    "RoutingReloader",
     "RunMode",
     "SourceAdapter",
     "SourceItem",

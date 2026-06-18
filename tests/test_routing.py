@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from uuid import UUID
 
@@ -10,6 +11,7 @@ from ironrag_connector.routing import (
     Router,
     RoutingConfig,
     RoutingError,
+    RoutingReloader,
     load_routing_config,
 )
 from ironrag_connector.source import SourceItemRef
@@ -106,3 +108,64 @@ policies:
     table = router.build_policies(defaults)
     assert table.for_kind("page").on_missing is DeleteAction.DELETE
     assert table.for_kind("image").on_missing is DeleteAction.IGNORE
+
+
+def test_routing_reloader_updates_router_and_policy_table(tmp_path: Path) -> None:
+    yaml_path = tmp_path / "routing.yaml"
+    yaml_path.write_text(
+        f"default: {{ workspace: {WS}, library: {LIB_DEFAULT} }}\n",
+        encoding="utf-8",
+    )
+    router = Router(load_routing_config(yaml_path))
+    policies = router.build_policies(PushPolicy())
+    reloader = RoutingReloader(
+        path=yaml_path,
+        router=router,
+        policies=policies,
+        defaults=PushPolicy(),
+    )
+
+    assert router.resolve(_ref("1")).library_id == LIB_DEFAULT
+    assert policies.for_kind("image").on_missing is DeleteAction.DELETE
+
+    yaml_path.write_text(
+        f"""
+default: {{ workspace: {WS}, library: {LIB_ENG} }}
+policies:
+  image:
+    on_missing: ignore
+""".strip(),
+        encoding="utf-8",
+    )
+    _bump_mtime(yaml_path)
+
+    assert reloader.reload_if_changed() is True
+    assert router.resolve(_ref("1")).library_id == LIB_ENG
+    assert policies.for_kind("image").on_missing is DeleteAction.IGNORE
+
+
+def test_routing_reloader_keeps_previous_config_when_reload_fails(tmp_path: Path) -> None:
+    yaml_path = tmp_path / "routing.yaml"
+    yaml_path.write_text(
+        f"default: {{ workspace: {WS}, library: {LIB_DEFAULT} }}\n",
+        encoding="utf-8",
+    )
+    router = Router(load_routing_config(yaml_path))
+    policies = router.build_policies(PushPolicy())
+    reloader = RoutingReloader(
+        path=yaml_path,
+        router=router,
+        policies=policies,
+        defaults=PushPolicy(),
+    )
+
+    yaml_path.write_text("42\n", encoding="utf-8")
+    _bump_mtime(yaml_path)
+
+    assert reloader.reload_if_changed() is False
+    assert router.resolve(_ref("1")).library_id == LIB_DEFAULT
+
+
+def _bump_mtime(path: Path) -> None:
+    next_mtime_ns = path.stat().st_mtime_ns + 1_000_000
+    os.utime(path, ns=(next_mtime_ns, next_mtime_ns))

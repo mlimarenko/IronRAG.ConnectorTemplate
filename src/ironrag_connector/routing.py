@@ -44,6 +44,7 @@ from uuid import UUID
 import yaml
 from pydantic import BaseModel, Field, field_validator
 
+from .observability import get_logger
 from .policy import (
     DeleteAction,
     DuplicateContentAction,
@@ -53,6 +54,8 @@ from .policy import (
     UpsertAction,
 )
 from .source import SourceItemRef
+
+log = get_logger(__name__)
 
 
 class RouteTarget(BaseModel):
@@ -121,7 +124,7 @@ class ResolvedRoute:
     """Empty string means the default route was used."""
 
 
-@dataclass(frozen=True)
+@dataclass
 class PolicyOverrides:
     """Resolved per-kind policy table built from YAML + env defaults."""
 
@@ -149,6 +152,10 @@ class Router:
     """Resolve a SourceItemRef to a (workspace, library) target."""
 
     def __init__(self, config: RoutingConfig) -> None:
+        self._config = config
+
+    def replace_config(self, config: RoutingConfig) -> None:
+        """Swap routing rules in-place so existing users see the new config."""
         self._config = config
 
     def target_libraries(self) -> set[UUID]:
@@ -195,6 +202,61 @@ class Router:
         return PolicyOverrides(default=defaults, by_kind=by_kind)
 
 
+class RoutingReloader:
+    """Reload routing.yaml into the framework-owned router when it changes."""
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        router: Router,
+        policies: PolicyOverrides,
+        defaults: PushPolicy,
+    ) -> None:
+        self._path = path
+        self._router = router
+        self._policies = policies
+        self._defaults = defaults
+        self._mtime_ns = _mtime_ns(path)
+
+    def reload_if_changed(self) -> bool:
+        try:
+            current_mtime_ns = _mtime_ns(self._path)
+        except OSError as exc:
+            log.error(
+                "routing.reload_error",
+                path=str(self._path),
+                error_type=type(exc).__name__,
+                error=str(exc) or repr(exc),
+            )
+            return False
+        if current_mtime_ns == self._mtime_ns:
+            return False
+        try:
+            config = load_routing_config(self._path)
+        except Exception as exc:
+            log.error(
+                "routing.reload_error",
+                path=str(self._path),
+                error_type=type(exc).__name__,
+                error=str(exc) or repr(exc),
+            )
+            return False
+        self._router.replace_config(config)
+        updated = self._router.build_policies(self._defaults)
+        self._policies.default = updated.default
+        self._policies.by_kind = updated.by_kind
+        self._mtime_ns = current_mtime_ns
+        log.info(
+            "routing.reloaded",
+            path=str(self._path),
+            rules=len(config.rules),
+            has_default=config.default is not None,
+            policy_overrides=list(config.policies.keys()),
+        )
+        return True
+
+
 def _facts_match(criteria: dict[str, Any], facts: dict[str, Any]) -> bool:
     for key, expected in criteria.items():
         actual = facts.get(key)
@@ -211,3 +273,7 @@ def _facts_match(criteria: dict[str, Any], facts: dict[str, Any]) -> bool:
 
 def known_kinds(rules: Iterable[RouteRule]) -> set[str]:
     return set()  # reserved for future per-rule kind filters
+
+
+def _mtime_ns(path: Path) -> int:
+    return path.stat().st_mtime_ns

@@ -93,6 +93,15 @@ class NoopOrchestrator:
         raise AssertionError("no documents should be reaped in these tests")
 
 
+class CountingReloader:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def reload_if_changed(self) -> bool:
+        self.calls += 1
+        return False
+
+
 class BlockingOrchestrator(NoopOrchestrator):
     def __init__(self, started: asyncio.Event, cancelled: asyncio.Event) -> None:
         self._started = started
@@ -124,6 +133,7 @@ def _manager(
     ironrag: Any | None = None,
     item_timeout_seconds: float = 300.0,
     reaper_list_timeout_seconds: float = 30.0,
+    routing_reloader: Any | None = None,
 ) -> SyncManager:
     router = _router()
     return SyncManager(
@@ -137,6 +147,7 @@ def _manager(
         interval_seconds=60,
         item_timeout_seconds=item_timeout_seconds,
         reaper_list_timeout_seconds=reaper_list_timeout_seconds,
+        routing_reloader=routing_reloader,
     )
 
 
@@ -220,3 +231,19 @@ async def test_reaper_list_timeout_releases_run_lock(tmp_path: Path) -> None:
 
     second = await asyncio.wait_for(manager.run_once(reason="after-reaper"), timeout=1)
     assert second.items_seen == 1
+
+
+@pytest.mark.asyncio
+async def test_run_once_reloads_routing_before_sweep(tmp_path: Path) -> None:
+    reloader = CountingReloader()
+    manager = _manager(
+        tmp_path,
+        adapter=OneRefAdapter(asyncio.Event(), asyncio.Event()),
+        orchestrator=NoopOrchestrator(),
+        routing_reloader=reloader,
+    )
+
+    report = await manager.run_once(reason="reload-test")
+
+    assert report.items_seen == 1
+    assert reloader.calls == 1

@@ -31,7 +31,7 @@ from .ironrag import IronRagClient, IronRagError, document_library_id
 from .observability import get_logger
 from .orchestrator import OrchestrationOutcome, Orchestrator
 from .policy import DeleteAction
-from .routing import PolicyOverrides, Router
+from .routing import PolicyOverrides, Router, RoutingReloader
 from .source import SourceAdapter
 from .state import StateStore
 
@@ -95,6 +95,7 @@ class SyncManager:
         cursor_library_lookup_timeout_seconds: float = 5.0,
         cursor_library_lookup_max_rows_per_sweep: int = 16,
         reaper_list_timeout_seconds: float = 30.0,
+        routing_reloader: RoutingReloader | None = None,
     ) -> None:
         self._adapter = adapter
         self._ironrag = ironrag
@@ -108,6 +109,7 @@ class SyncManager:
         self._cursor_library_lookup_timeout = cursor_library_lookup_timeout_seconds
         self._cursor_library_lookup_max_rows = cursor_library_lookup_max_rows_per_sweep
         self._reaper_list_timeout = reaper_list_timeout_seconds
+        self._routing_reloader = routing_reloader
         self._run_lock = asyncio.Lock()
 
     async def run_once(self, *, reason: str) -> SyncReport:
@@ -127,6 +129,8 @@ class SyncManager:
         started = datetime.now(tz=UTC)
         log.info("sync.start", reason=reason, connector=self._adapter.name)
         report = SyncReport(started_at=started, finished_at=started)
+        if self._routing_reloader is not None:
+            self._routing_reloader.reload_if_changed()
         # Reset the orchestrator's in-sweep dedup cache so the same
         # external_key reached from multiple parents collapses to one
         # IronRAG mutation per sweep.
