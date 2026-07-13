@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.1.0 — 2026-07-14
+
+- Replaced UUID routing targets with canonical, human-readable
+  `<workspace-slug>/<library-slug>` catalog references shared with IronRAG MCP.
+  The redundant `workspace` key and UUID-only `library` values are no longer
+  accepted.
+- Resolve the complete routing snapshot through IronRAG's permission-filtered
+  workspace and library catalog before startup, while keeping UUIDs internal to
+  content mutations, cursor state, and orphan reaping.
+- Made routing hot reload asynchronous and atomic: every target in a candidate
+  file must resolve before routes and policies are swapped; invalid,
+  unauthorized, or temporarily unavailable candidates leave the previous
+  working snapshot active and are retried.
+- Added startup cleanup and cursor-seeder catalog resolution, strict rejection
+  of unknown routing keys, catalog response validation, and regression coverage
+  for startup failure, authorization errors, ambiguity, cross-workspace routes,
+  retry-after-failure, and friendly-ref seeding.
+- Expanded `routing.yaml.example` into the complete schema reference, including
+  every key, type, default, match rule, and policy enum.
+- Raised dependency floors to patched `pydantic-settings`, `python-multipart`,
+  and `starlette` releases after a release-gate vulnerability audit.
+- Bumped the package version to 0.1.0.
+
 ## 0.0.11 — 2026-06-18
 
 - Added routing config reload for sweeps and webhooks. When `routing.yaml`

@@ -7,12 +7,16 @@ import pytest
 
 from ironrag_connector.config import BaseConnectorSettings
 from ironrag_connector.ironrag import (
+    IronRagCatalogError,
     IronRagClient,
     IronRagMutationTimeoutError,
     document_library_id,
 )
 
 LIB = UUID("00000000-0000-0000-0000-000000000000")
+LIB_2 = UUID("00000000-0000-0000-0000-000000000001")
+WS = UUID("00000000-0000-0000-0000-000000000099")
+WS_2 = UUID("00000000-0000-0000-0000-000000000098")
 
 
 def _settings() -> BaseConnectorSettings:
@@ -31,6 +35,147 @@ def _client(handler: httpx.MockTransport) -> IronRagClient:
             transport=handler,
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_resolve_library_refs_uses_permission_filtered_catalog_snapshot() -> None:
+    requests: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        if request.url.path == "/v1/catalog/workspaces":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": str(WS),
+                        "slug": "main",
+                        "displayName": "Main workspace",
+                        "lifecycleState": "active",
+                    },
+                    {
+                        "id": str(WS_2),
+                        "slug": "partner",
+                        "displayName": "Partner workspace",
+                        "lifecycleState": "active",
+                    },
+                ],
+            )
+        if request.url.path == f"/v1/catalog/workspaces/{WS}/libraries":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": str(LIB),
+                        "workspaceId": str(WS),
+                        "slug": "product-docs",
+                        "displayName": "Product documentation",
+                    }
+                ],
+            )
+        if request.url.path == f"/v1/catalog/workspaces/{WS_2}/libraries":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": str(LIB_2),
+                        "workspaceId": str(WS_2),
+                        "slug": "archive",
+                        "displayName": "Archive",
+                    }
+                ],
+            )
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    client = _client(httpx.MockTransport(handle))
+    targets = await client.resolve_library_refs({"main/product-docs", "partner/archive"})
+    await client.aclose()
+
+    assert targets["main/product-docs"].workspace_id == WS
+    assert targets["main/product-docs"].library_id == LIB
+    assert targets["partner/archive"].workspace_id == WS_2
+    assert targets["partner/archive"].library_id == LIB_2
+    assert requests == [
+        "/v1/catalog/workspaces",
+        f"/v1/catalog/workspaces/{WS}/libraries",
+        f"/v1/catalog/workspaces/{WS_2}/libraries",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_library_refs_never_falls_back_to_display_name() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/catalog/workspaces"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": str(WS),
+                    "slug": "main",
+                    "displayName": "Friendly Main",
+                    "lifecycleState": "active",
+                }
+            ],
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    with pytest.raises(IronRagCatalogError, match="Friendly Main/product-docs"):
+        await client.resolve_library_refs({"Friendly Main/product-docs"})
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resolve_library_refs_rejects_catalog_workspace_mismatch() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/catalog/workspaces":
+            return httpx.Response(
+                200,
+                json=[{"id": str(WS), "slug": "main", "displayName": "Main"}],
+            )
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": str(LIB),
+                    "workspaceId": str(WS_2),
+                    "slug": "product-docs",
+                    "displayName": "Product docs",
+                }
+            ],
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    with pytest.raises(IronRagCatalogError, match="workspaceId"):
+        await client.resolve_library_refs({"main/product-docs"})
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resolve_library_refs_surfaces_catalog_authorization_failure() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"error": "forbidden"})
+
+    client = _client(httpx.MockTransport(handle))
+    with pytest.raises(IronRagCatalogError, match="403"):
+        await client.resolve_library_refs({"main/product-docs"})
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_resolve_library_refs_rejects_ambiguous_catalog_snapshot() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {"id": str(WS), "slug": "main", "displayName": "Main"},
+                {"id": str(WS_2), "slug": "main", "displayName": "Duplicate"},
+            ],
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    with pytest.raises(IronRagCatalogError, match="duplicate workspace slug 'main'"):
+        await client.resolve_library_refs({"main/product-docs"})
+    await client.aclose()
 
 
 @pytest.mark.asyncio
@@ -157,9 +302,7 @@ async def test_list_by_prefix_follows_cursor_pages() -> None:
         )
 
     client = _client(httpx.MockTransport(handle))
-    pairs = await client.list_documents_by_external_key_prefix(
-        LIB, "source:page:", page_size=2
-    )
+    pairs = await client.list_documents_by_external_key_prefix(LIB, "source:page:", page_size=2)
     await client.aclose()
 
     assert pairs == [("source:page:1", "doc-1"), ("source:page:2", "doc-2")]
@@ -223,9 +366,7 @@ async def test_list_by_prefix_supports_legacy_offset_total_pages() -> None:
         )
 
     client = _client(httpx.MockTransport(handle))
-    pairs = await client.list_documents_by_external_key_prefix(
-        LIB, "source:page:", page_size=2
-    )
+    pairs = await client.list_documents_by_external_key_prefix(LIB, "source:page:", page_size=2)
     await client.aclose()
 
     assert pairs == [

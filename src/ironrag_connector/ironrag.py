@@ -3,8 +3,11 @@
 Endpoints
 =========
 
-The connector talks to four IronRAG endpoints:
+The connector talks to the following IronRAG endpoints:
 
+* ``GET /v1/catalog/workspaces`` and
+  ``GET /v1/catalog/workspaces/{id}/libraries`` — resolve canonical
+  ``workspace-slug/library-slug`` routing refs once per routing snapshot.
 * ``GET /v1/content/documents?libraryId=&externalKey=`` — find an existing
   document by the canonical external key the adapter coined.
 * ``POST /v1/content/documents/upload`` (multipart) — create a new document.
@@ -31,7 +34,7 @@ The orchestrator detects ``duplicate_of_existing=True`` and applies the
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 from uuid import UUID
 
@@ -39,6 +42,7 @@ import httpx
 
 from .config import BaseConnectorSettings
 from .observability import get_logger
+from .routing import ResolvedLibraryTarget, normalize_library_ref
 
 log = get_logger(__name__)
 
@@ -50,6 +54,10 @@ _EXISTING_DOC_RE = re.compile(
 
 class IronRagError(RuntimeError):
     """IronRAG returned a non-recoverable status."""
+
+
+class IronRagCatalogError(IronRagError):
+    """IronRAG could not resolve a canonical catalog reference."""
 
 
 class IronRagMutationTimeoutError(IronRagError):
@@ -89,6 +97,94 @@ class IronRagClient:
     async def __aexit__(self, *_: object) -> None:
         await self.aclose()
 
+    async def resolve_library_refs(
+        self,
+        library_refs: set[str],
+    ) -> dict[str, ResolvedLibraryTarget]:
+        """Resolve canonical ``workspace/library`` refs to internal UUIDs.
+
+        IronRAG catalog list endpoints are permission-filtered, so a missing
+        ref is deliberately indistinguishable from a ref the caller cannot
+        discover. Resolution happens once for the complete routing snapshot;
+        document mutations continue using UUIDs internally.
+        """
+        normalized_refs = {normalize_library_ref(ref) for ref in library_refs}
+        if normalized_refs != library_refs:
+            raise IronRagCatalogError("library refs must already be canonical")
+        if not normalized_refs:
+            return {}
+
+        workspaces_payload = await self._catalog_list(
+            "/v1/catalog/workspaces",
+            resource="workspaces",
+        )
+        workspaces = _index_catalog_rows(workspaces_payload, resource="workspace")
+
+        refs_by_workspace: dict[str, set[str]] = {}
+        for library_ref in normalized_refs:
+            workspace_slug, _ = library_ref.split("/", 1)
+            refs_by_workspace.setdefault(workspace_slug, set()).add(library_ref)
+
+        result: dict[str, ResolvedLibraryTarget] = {}
+        for workspace_slug in sorted(refs_by_workspace):
+            workspace = workspaces.get(workspace_slug)
+            if workspace is None:
+                refs = ", ".join(sorted(refs_by_workspace[workspace_slug]))
+                raise IronRagCatalogError(
+                    f"IronRAG workspace slug '{workspace_slug}' is not visible "
+                    f"for library ref(s): {refs}"
+                )
+            workspace_id = _catalog_uuid(workspace, "id", "workspace", workspace_slug)
+            libraries_payload = await self._catalog_list(
+                f"/v1/catalog/workspaces/{workspace_id}/libraries",
+                resource=f"libraries in workspace '{workspace_slug}'",
+            )
+            libraries = _index_catalog_rows(libraries_payload, resource="library")
+
+            for library_ref in sorted(refs_by_workspace[workspace_slug]):
+                _, library_slug = library_ref.split("/", 1)
+                library = libraries.get(library_slug)
+                if library is None:
+                    raise IronRagCatalogError(f"IronRAG library ref '{library_ref}' is not visible")
+                row_workspace_id = _catalog_uuid(
+                    library,
+                    "workspaceId",
+                    "library",
+                    library_ref,
+                )
+                if row_workspace_id != workspace_id:
+                    raise IronRagCatalogError(
+                        f"IronRAG library ref '{library_ref}' returned workspaceId "
+                        f"{row_workspace_id}, expected {workspace_id}"
+                    )
+                result[library_ref] = ResolvedLibraryTarget(
+                    library_ref=library_ref,
+                    workspace_id=workspace_id,
+                    library_id=_catalog_uuid(library, "id", "library", library_ref),
+                )
+        return result
+
+    async def _catalog_list(
+        self,
+        path: str,
+        *,
+        resource: str,
+    ) -> list[Mapping[str, Any]]:
+        response = await self._client.get(path)
+        if response.status_code >= 400:
+            raise IronRagCatalogError(
+                f"IronRAG catalog {resource} → {response.status_code}: {response.text[:400]}"
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise IronRagCatalogError(f"IronRAG catalog {resource} returned invalid JSON") from exc
+        if not isinstance(payload, list) or not all(isinstance(item, Mapping) for item in payload):
+            raise IronRagCatalogError(
+                f"IronRAG catalog {resource} must return a JSON array of objects"
+            )
+        return payload
+
     async def find_document_by_external_key(
         self, library_id: UUID, external_key: str
     ) -> dict[str, Any] | None:
@@ -122,11 +218,7 @@ class IronRagClient:
                 params["cursor"] = cursor
 
             response = await self._client.get("/v1/content/documents", params=params)
-            if (
-                response.status_code in (400, 422)
-                and use_search
-                and cursor is None
-            ):
+            if response.status_code in (400, 422) and use_search and cursor is None:
                 # Backend does not understand the search filter — retry the
                 # whole lookup as a plain paginated scan.
                 use_search = False
@@ -135,14 +227,11 @@ class IronRagClient:
                 return None
             if response.status_code >= 400:
                 raise IronRagError(
-                    f"IronRAG list documents → {response.status_code}: "
-                    f"{response.text[:400]}"
+                    f"IronRAG list documents → {response.status_code}: {response.text[:400]}"
                 )
 
             payload = response.json()
-            items: list[dict[str, Any]] = payload.get(
-                "items", payload.get("documents", [])
-            )
+            items: list[dict[str, Any]] = payload.get("items", payload.get("documents", []))
             for item in items:
                 if item.get("externalKey") == external_key:
                     return item
@@ -225,9 +314,7 @@ class IronRagClient:
                 }
 
         if response.status_code >= 400:
-            raise IronRagError(
-                f"IronRAG upload → {response.status_code}: {response.text[:400]}"
-            )
+            raise IronRagError(f"IronRAG upload → {response.status_code}: {response.text[:400]}")
         payload = _json_object(response)
         log.info(
             "ironrag.mutation.accepted",
@@ -280,9 +367,7 @@ class IronRagClient:
         if response.status_code in (404, 410):
             return None
         if response.status_code >= 400:
-            raise IronRagError(
-                f"IronRAG replace → {response.status_code}: {response.text[:400]}"
-            )
+            raise IronRagError(f"IronRAG replace → {response.status_code}: {response.text[:400]}")
         payload = _json_object(response)
         log.info(
             "ironrag.mutation.accepted",
@@ -347,8 +432,7 @@ class IronRagClient:
                 break
             if response.status_code >= 400:
                 raise IronRagError(
-                    f"IronRAG list documents → {response.status_code}: "
-                    f"{response.text[:400]}"
+                    f"IronRAG list documents → {response.status_code}: {response.text[:400]}"
                 )
 
             payload = response.json()
@@ -382,9 +466,7 @@ class IronRagClient:
 
         return results
 
-    async def delete_document(
-        self, document_id: UUID | str, idempotency_key: str
-    ) -> None:
+    async def delete_document(self, document_id: UUID | str, idempotency_key: str) -> None:
         log.info(
             "ironrag.mutation.start",
             operation="delete",
@@ -416,9 +498,7 @@ class IronRagClient:
                 status_code=response.status_code,
             )
             return
-        raise IronRagError(
-            f"IronRAG delete → {response.status_code}: {response.text[:400]}"
-        )
+        raise IronRagError(f"IronRAG delete → {response.status_code}: {response.text[:400]}")
 
 
 def _optional_int(value: object) -> int | None:
@@ -452,3 +532,36 @@ def document_library_id(document: Mapping[str, Any]) -> str | None:
         if value:
             return str(value)
     return None
+
+
+def _index_catalog_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    resource: str,
+) -> dict[str, Mapping[str, Any]]:
+    indexed: dict[str, Mapping[str, Any]] = {}
+    for row in rows:
+        slug = row.get("slug")
+        if not isinstance(slug, str) or not slug:
+            raise IronRagCatalogError(f"IronRAG catalog {resource} row has an invalid slug")
+        if slug in indexed:
+            raise IronRagCatalogError(
+                f"IronRAG catalog returned duplicate {resource} slug '{slug}'"
+            )
+        indexed[slug] = row
+    return indexed
+
+
+def _catalog_uuid(
+    row: Mapping[str, Any],
+    key: str,
+    resource: str,
+    catalog_ref: str,
+) -> UUID:
+    raw = row.get(key)
+    try:
+        return UUID(str(raw))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise IronRagCatalogError(
+            f"IronRAG {resource} '{catalog_ref}' returned invalid {key}"
+        ) from exc

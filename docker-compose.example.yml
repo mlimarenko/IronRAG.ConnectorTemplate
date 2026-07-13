@@ -6,7 +6,7 @@
 # IronRAG.BookStack for working instances.
 #
 #   cp .env.example .env.local             # IRONRAG_* + ADMIN_BEARER_TOKEN + vendor creds
-#   cp routing.yaml.example routing.yaml   # map source items → (workspace, library)
+#   cp routing.yaml.example routing.yaml   # map items → workspace/library slugs
 #   docker compose up -d
 services:
   connector:

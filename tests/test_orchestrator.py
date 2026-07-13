@@ -19,6 +19,7 @@ from ironrag_connector.policy import (
 )
 from ironrag_connector.routing import (
     PolicyOverrides,
+    ResolvedLibraryTarget,
     Router,
     RoutingConfig,
 )
@@ -136,16 +137,27 @@ class FakeIronRag:
         ]
 
 
-def _routing() -> RoutingConfig:
-    return RoutingConfig.model_validate(
-        {"default": {"workspace": str(WS), "library": str(LIB)}}
+def _library_ref(library_id: UUID) -> str:
+    return f"tests/library-{library_id.hex}"
+
+
+def _router_to(library_id: UUID) -> Router:
+    library_ref = _library_ref(library_id)
+    config = RoutingConfig.model_validate({"default": {"library": library_ref}})
+    return Router(
+        config,
+        resolved_targets={
+            library_ref: ResolvedLibraryTarget(
+                library_ref=library_ref,
+                workspace_id=WS,
+                library_id=library_id,
+            )
+        },
     )
 
 
-def _routing_to(library_id: UUID) -> RoutingConfig:
-    return RoutingConfig.model_validate(
-        {"default": {"workspace": str(WS), "library": str(library_id)}}
-    )
+def _router() -> Router:
+    return _router_to(LIB)
 
 
 def _policies(default: PushPolicy | None = None) -> PolicyOverrides:
@@ -158,19 +170,13 @@ def _state(tmp_path: Path) -> StateStore:
 
 @pytest.mark.asyncio
 async def test_create_new_item(tmp_path: Path) -> None:
-    adapter = EchoAdapter(
-        {
-            "1": EchoPage(
-                item_id="1", title="One", body="hello", updated_at="t1"
-            )
-        }
-    )
+    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t1")})
     state = _state(tmp_path)
     ironrag = FakeIronRag()
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(),
     )
@@ -189,7 +195,7 @@ async def test_document_hint_forwards_on_upload(tmp_path: Path) -> None:
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(),
     )
@@ -206,7 +212,7 @@ async def test_document_hint_forwards_on_upload(tmp_path: Path) -> None:
         title="Hinted",
         document_hint="https://docs.example/hinted",
     )
-    route = Router(_routing()).resolve(item.ref)
+    route = _router().resolve(item.ref)
 
     out = await orchestrator.push_item(item, route, PushPolicy())
 
@@ -226,7 +232,7 @@ async def test_document_hint_forwards_on_replace(tmp_path: Path) -> None:
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(),
     )
@@ -243,7 +249,7 @@ async def test_document_hint_forwards_on_replace(tmp_path: Path) -> None:
         title="Hinted",
         document_hint="Canonical page label",
     )
-    route = Router(_routing()).resolve(item.ref)
+    route = _router().resolve(item.ref)
 
     out = await orchestrator.push_item(item, route, PushPolicy())
 
@@ -253,9 +259,7 @@ async def test_document_hint_forwards_on_replace(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_unchanged_short_circuits_to_noop(tmp_path: Path) -> None:
-    adapter = EchoAdapter(
-        {"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t1")}
-    )
+    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t1")})
     state = _state(tmp_path)
     ironrag = FakeIronRag()
     ironrag.documents[(LIB, "echo:page:1")] = {
@@ -273,7 +277,7 @@ async def test_unchanged_short_circuits_to_noop(tmp_path: Path) -> None:
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(),
     )
@@ -286,9 +290,7 @@ async def test_unchanged_short_circuits_to_noop(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_changed_item_replaces(tmp_path: Path) -> None:
-    adapter = EchoAdapter(
-        {"1": EchoPage(item_id="1", title="One", body="hello2", updated_at="t2")}
-    )
+    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hello2", updated_at="t2")})
     state = _state(tmp_path)
     ironrag = FakeIronRag()
     ironrag.documents[(LIB, "echo:page:1")] = {
@@ -306,7 +308,7 @@ async def test_changed_item_replaces(tmp_path: Path) -> None:
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(),
     )
@@ -321,9 +323,7 @@ async def test_changed_item_replaces(tmp_path: Path) -> None:
 async def test_conflicting_replace_is_deferred_without_advancing_cursor(
     tmp_path: Path,
 ) -> None:
-    adapter = EchoAdapter(
-        {"1": EchoPage(item_id="1", title="One", body="hello2", updated_at="t2")}
-    )
+    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hello2", updated_at="t2")})
     state = _state(tmp_path)
     ironrag = FakeIronRag()
     ironrag.documents[(LIB, "echo:page:1")] = {
@@ -342,7 +342,7 @@ async def test_conflicting_replace_is_deferred_without_advancing_cursor(
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(),
     )
@@ -363,9 +363,7 @@ async def test_conflicting_replace_is_deferred_without_advancing_cursor(
 async def test_legacy_cursor_same_route_conflict_preserves_old_token(
     tmp_path: Path,
 ) -> None:
-    adapter = EchoAdapter(
-        {"1": EchoPage(item_id="1", title="One", body="hello2", updated_at="t2")}
-    )
+    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hello2", updated_at="t2")})
     state = _state(tmp_path)
     ironrag = FakeIronRag()
     ironrag.documents[(LIB, "echo:page:1")] = {
@@ -384,7 +382,7 @@ async def test_legacy_cursor_same_route_conflict_preserves_old_token(
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(),
     )
@@ -405,9 +403,7 @@ async def test_legacy_cursor_same_route_conflict_preserves_old_token(
 
 @pytest.mark.asyncio
 async def test_on_changed_skip_does_not_replace(tmp_path: Path) -> None:
-    adapter = EchoAdapter(
-        {"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t2")}
-    )
+    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t2")})
     state = _state(tmp_path)
     ironrag = FakeIronRag()
     ironrag.documents[(LIB, "echo:page:1")] = {
@@ -418,7 +414,7 @@ async def test_on_changed_skip_does_not_replace(tmp_path: Path) -> None:
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(policy),
     )
@@ -430,16 +426,14 @@ async def test_on_changed_skip_does_not_replace(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_on_new_skip_does_not_create(tmp_path: Path) -> None:
-    adapter = EchoAdapter(
-        {"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t1")}
-    )
+    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t1")})
     state = _state(tmp_path)
     ironrag = FakeIronRag()
     policy = PushPolicy(on_new=UpsertAction.SKIP)
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(policy),
     )
@@ -451,9 +445,7 @@ async def test_on_new_skip_does_not_create(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_duplicate_content_skip(tmp_path: Path) -> None:
-    adapter = EchoAdapter(
-        {"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t1")}
-    )
+    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t1")})
     state = _state(tmp_path)
     ironrag = FakeIronRag()
     ironrag.duplicate_for_key = "echo:page:1"
@@ -461,7 +453,7 @@ async def test_duplicate_content_skip(tmp_path: Path) -> None:
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(policy),
     )
@@ -480,9 +472,7 @@ async def test_cursor_wins_over_server_find(tmp_path: Path) -> None:
     always. Without the cursor-wins fix the orchestrator would re-upload
     and trip a unique-violation server-side.
     """
-    adapter = EchoAdapter(
-        {"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t2")}
-    )
+    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t2")})
     state = _state(tmp_path)
     state.upsert(
         kind="page",
@@ -505,7 +495,7 @@ async def test_cursor_wins_over_server_find(tmp_path: Path) -> None:
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(),
     )
@@ -518,9 +508,7 @@ async def test_cursor_wins_over_server_find(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_replace_timeout_is_deferred_without_advancing_cursor(tmp_path: Path) -> None:
-    adapter = EchoAdapter(
-        {"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t2")}
-    )
+    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t2")})
     state = _state(tmp_path)
     state.upsert(
         kind="page",
@@ -543,7 +531,7 @@ async def test_replace_timeout_is_deferred_without_advancing_cursor(tmp_path: Pa
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(),
     )
@@ -563,9 +551,7 @@ async def test_replace_timeout_is_deferred_without_advancing_cursor(tmp_path: Pa
 async def test_legacy_cursor_library_is_backfilled_before_trusting_doc_id(
     tmp_path: Path,
 ) -> None:
-    adapter = EchoAdapter(
-        {"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t2")}
-    )
+    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t2")})
     state = _state(tmp_path)
     state.upsert(
         kind="page",
@@ -587,7 +573,7 @@ async def test_legacy_cursor_library_is_backfilled_before_trusting_doc_id(
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(),
     )
@@ -607,9 +593,7 @@ async def test_legacy_cursor_library_is_backfilled_before_trusting_doc_id(
 async def test_legacy_cursor_unknown_library_blocks_possible_duplicate_upload(
     tmp_path: Path,
 ) -> None:
-    adapter = EchoAdapter(
-        {"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t2")}
-    )
+    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t2")})
     state = _state(tmp_path)
     state.upsert(
         kind="page",
@@ -630,7 +614,7 @@ async def test_legacy_cursor_unknown_library_blocks_possible_duplicate_upload(
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(),
     )
@@ -646,9 +630,7 @@ async def test_legacy_cursor_unknown_library_blocks_possible_duplicate_upload(
 async def test_legacy_cursor_lookup_timeout_blocks_possible_duplicate_upload(
     tmp_path: Path,
 ) -> None:
-    adapter = EchoAdapter(
-        {"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t2")}
-    )
+    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t2")})
     state = _state(tmp_path)
     state.upsert(
         kind="page",
@@ -669,7 +651,7 @@ async def test_legacy_cursor_lookup_timeout_blocks_possible_duplicate_upload(
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(),
         cursor_library_lookup_timeout_seconds=0.01,
@@ -684,9 +666,7 @@ async def test_legacy_cursor_lookup_timeout_blocks_possible_duplicate_upload(
 
 @pytest.mark.asyncio
 async def test_route_move_creates_new_target_and_reaps_old_target(tmp_path: Path) -> None:
-    adapter = EchoAdapter(
-        {"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t1")}
-    )
+    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t1")})
     state = _state(tmp_path)
     external_key = "echo:page:1"
     state.upsert(
@@ -702,7 +682,7 @@ async def test_route_move_creates_new_target_and_reaps_old_target(tmp_path: Path
         "id": "doc-old",
         "externalKey": external_key,
     }
-    router = Router(_routing_to(LIB2))
+    router = _router_to(LIB2)
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
@@ -736,9 +716,7 @@ async def test_route_move_creates_new_target_and_reaps_old_target(tmp_path: Path
 
 @pytest.mark.asyncio
 async def test_route_move_from_legacy_cursor_reaps_old_target(tmp_path: Path) -> None:
-    adapter = EchoAdapter(
-        {"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t1")}
-    )
+    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t1")})
     state = _state(tmp_path)
     external_key = "echo:page:1"
     state.upsert(
@@ -753,7 +731,7 @@ async def test_route_move_from_legacy_cursor_reaps_old_target(tmp_path: Path) ->
         "id": "doc-old",
         "externalKey": external_key,
     }
-    router = Router(_routing_to(LIB2))
+    router = _router_to(LIB2)
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
@@ -795,7 +773,7 @@ async def test_reap_respects_ignore_policy(tmp_path: Path) -> None:
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(),
     )
@@ -811,9 +789,7 @@ async def test_reap_respects_ignore_policy(tmp_path: Path) -> None:
 async def test_cursor_library_timeout_does_not_abort_sweep_before_enumeration(
     tmp_path: Path,
 ) -> None:
-    adapter = EchoAdapter(
-        {"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t1")}
-    )
+    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t1")})
     state = _state(tmp_path)
     external_key = "echo:page:1"
     state.upsert(
@@ -833,7 +809,7 @@ async def test_cursor_library_timeout_does_not_abort_sweep_before_enumeration(
         "id": "doc-pre",
         "externalKey": external_key,
     }
-    router = Router(_routing())
+    router = _router()
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
@@ -886,7 +862,7 @@ async def test_pre_enumeration_cursor_backfill_preserves_pushed_timestamp(
         "id": "doc-pre",
         "externalKey": external_key,
     }
-    router = Router(_routing())
+    router = _router()
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
@@ -952,7 +928,7 @@ async def test_reaper_uses_partial_cursor_libraries_without_false_delete(
         "id": "doc-unknown",
         "externalKey": "echo:page:unknown-old",
     }
-    router = Router(_routing_to(LIB2))
+    router = _router_to(LIB2)
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
@@ -992,7 +968,7 @@ async def test_idempotency_key_is_content_addressed(tmp_path: Path) -> None:
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(),
     )
@@ -1011,7 +987,7 @@ async def test_idempotency_key_is_content_addressed(tmp_path: Path) -> None:
             title="One",
         )
 
-    route = Router(_routing()).resolve(_item(b"a").ref)
+    route = _router().resolve(_item(b"a").ref)
 
     await orchestrator.push_item(_item(b"<p>render A</p>"), route, PushPolicy())
     first_key = ironrag.uploads[0]["idempotency_key"]
@@ -1032,9 +1008,7 @@ async def test_noop_persists_doc_id_to_cursor(tmp_path: Path) -> None:
     """A seed cursor that knows change_token but not the document id must be
     upgraded with the discovered id on the first sweep, so later sweeps
     short-circuit with zero list-endpoint calls."""
-    adapter = EchoAdapter(
-        {"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t1")}
-    )
+    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t1")})
     state = _state(tmp_path)
     # Seed cursor: change_token known, document id absent.
     state.upsert(
@@ -1052,7 +1026,7 @@ async def test_noop_persists_doc_id_to_cursor(tmp_path: Path) -> None:
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(),
     )
@@ -1114,7 +1088,7 @@ async def test_dependent_uploaded_with_parent_external_key(tmp_path: Path) -> No
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(),
     )
@@ -1182,7 +1156,7 @@ async def test_dependent_waits_when_primary_replace_is_deferred(tmp_path: Path) 
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(),
     )
@@ -1260,7 +1234,7 @@ async def test_dependent_deferral_restores_parent_cursor_for_retry(
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=Router(_routing()),
+        router=_router(),
         state=state,
         policies=_policies(),
     )

@@ -1,6 +1,6 @@
 [project]
 name = "ironrag-connector"
-version = "0.0.11"
+version = "0.1.0"
 description = "Framework for building data-source connectors that push content into IronRAG."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -12,9 +12,10 @@ dependencies = [
     "uvicorn[standard]>=0.32",
     "httpx>=0.27",
     "pydantic>=2.9",
-    "pydantic-settings>=2.6",
+    "pydantic-settings>=2.14.2",
     "structlog>=24.4",
-    "python-multipart>=0.0.20",
+    "python-multipart>=0.0.31",
+    "starlette>=1.3.1",
     "pyyaml>=6.0",
 ]
 

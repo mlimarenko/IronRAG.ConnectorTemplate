@@ -130,7 +130,7 @@ class SyncManager:
         log.info("sync.start", reason=reason, connector=self._adapter.name)
         report = SyncReport(started_at=started, finished_at=started)
         if self._routing_reloader is not None:
-            self._routing_reloader.reload_if_changed()
+            await self._routing_reloader.reload_if_changed()
         # Reset the orchestrator's in-sweep dedup cache so the same
         # external_key reached from multiple parents collapses to one
         # IronRAG mutation per sweep.
@@ -227,11 +227,7 @@ class SyncManager:
         log.info(
             "sync.done",
             reason=reason,
-            **{
-                k: v
-                for k, v in report.as_dict().items()
-                if k not in ("started_at", "finished_at")
-            },
+            **{k: v for k, v in report.as_dict().items() if k not in ("started_at", "finished_at")},
         )
         return report
 
@@ -326,9 +322,7 @@ class SyncManager:
                 try:
                     async with lookup_sem:
                         async with asyncio.timeout(self._cursor_library_lookup_timeout):
-                            document = await self._ironrag.get_document(
-                                row.ironrag_document_id
-                            )
+                            document = await self._ironrag.get_document(row.ironrag_document_id)
                 except TimeoutError:
                     log.warning(
                         "sync.reap.cursor_library_lookup_timeout",
@@ -440,8 +434,7 @@ def _log_outcome(outcome: OrchestrationOutcome) -> None:
         rule=outcome.rule_description,
         detail=outcome.detail,
         deferred=outcome.deferred,
-        title=(outcome.ref.raw or {}).get("name")
-        or (outcome.ref.raw or {}).get("title"),
+        title=(outcome.ref.raw or {}).get("name") or (outcome.ref.raw or {}).get("title"),
     )
 
 
@@ -452,9 +445,7 @@ def _record_seen_target(
         return
     if outcome.action in {"unrouted", "fetch_returned_none", "skipped_missing", "deleted"}:
         return
-    seen_targets.setdefault((outcome.ref.kind, outcome.ref.item_id), set()).add(
-        outcome.library_id
-    )
+    seen_targets.setdefault((outcome.ref.kind, outcome.ref.item_id), set()).add(outcome.library_id)
 
 
 def _document_still_expected(

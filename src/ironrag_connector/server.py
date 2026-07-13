@@ -30,7 +30,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -89,11 +89,13 @@ def build_app(
     router = Router(routing)
     policy_defaults = PolicyDefaults().as_push_policy()
     policies = router.build_policies(policy_defaults)
+    ironrag = IronRagClient(settings)
     routing_reloader = RoutingReloader(
         path=settings.routing_config_path,
         router=router,
         policies=policies,
         defaults=policy_defaults,
+        resolver=ironrag.resolve_library_refs,
     )
     log.info(
         "routing.loaded",
@@ -104,16 +106,13 @@ def build_app(
     )
 
     state = StateStore(settings.state_db_path)
-    ironrag = IronRagClient(settings)
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,
         router=router,
         state=state,
         policies=policies,
-        cursor_library_lookup_timeout_seconds=(
-            settings.cursor_library_lookup_timeout_seconds
-        ),
+        cursor_library_lookup_timeout_seconds=(settings.cursor_library_lookup_timeout_seconds),
     )
     sync_manager = SyncManager(
         adapter=adapter,
@@ -125,9 +124,7 @@ def build_app(
         concurrency=settings.sync_concurrency,
         interval_seconds=settings.sync_interval_seconds,
         item_timeout_seconds=settings.sync_item_timeout_seconds,
-        cursor_library_lookup_timeout_seconds=(
-            settings.cursor_library_lookup_timeout_seconds
-        ),
+        cursor_library_lookup_timeout_seconds=(settings.cursor_library_lookup_timeout_seconds),
         cursor_library_lookup_max_rows_per_sweep=(
             settings.cursor_library_lookup_max_rows_per_sweep
         ),
@@ -135,53 +132,60 @@ def build_app(
         routing_reloader=routing_reloader,
     )
 
-    pidfile_path = settings.pidfile_path or Path(
-        f"/tmp/ironrag-connector-{adapter.name}.pid"
-    )
+    pidfile_path = settings.pidfile_path or Path(f"/tmp/ironrag-connector-{adapter.name}.pid")
     pidfile = PidfileLock(pidfile_path)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         pidfile.acquire()
-        cancel_event = asyncio.Event()
-        sync_task: asyncio.Task[None] | None = None
-        startup_task: asyncio.Task[None] | None = None
+        async with AsyncExitStack() as resources:
+            resources.callback(pidfile.release)
+            resources.callback(state.close)
+            resources.push_async_callback(adapter.close)
+            resources.push_async_callback(ironrag.aclose)
 
-        if settings.run_mode is not RunMode.WEBHOOK:
-            if settings.sync_run_on_startup:
-                async def _startup_sync() -> None:
-                    try:
-                        await sync_manager.run_once(reason="startup")
-                    except SyncAlreadyRunningError as exc:
-                        log.info("sync.startup_skipped", reason=str(exc))
-                    except Exception as exc:
-                        log.error("sync.startup_error", error=str(exc))
+            await router.initialize(ironrag.resolve_library_refs)
+            log.info(
+                "routing.resolved",
+                library_refs=sorted(router.target_library_refs()),
+                libraries=len(router.target_libraries()),
+            )
 
-                startup_task = asyncio.create_task(_startup_sync())
+            cancel_event = asyncio.Event()
+            sync_task: asyncio.Task[None] | None = None
+            startup_task: asyncio.Task[None] | None = None
 
-            sync_task = asyncio.create_task(sync_manager.run_forever(cancel_event))
+            if settings.run_mode is not RunMode.WEBHOOK:
+                if settings.sync_run_on_startup:
 
-        log.info(
-            "connector.lifespan.up",
-            run_mode=settings.run_mode.value,
-            sync_active=sync_task is not None,
-            webhook_mounted=settings.run_mode is not RunMode.POLL
-            and bool(webhook_handlers),
-        )
+                    async def _startup_sync() -> None:
+                        try:
+                            await sync_manager.run_once(reason="startup")
+                        except SyncAlreadyRunningError as exc:
+                            log.info("sync.startup_skipped", reason=str(exc))
+                        except Exception as exc:
+                            log.error("sync.startup_error", error=str(exc))
 
-        try:
-            yield
-        finally:
-            cancel_event.set()
-            for task in (sync_task, startup_task):
-                if task is not None:
-                    task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await task
-            await ironrag.aclose()
-            await adapter.close()
-            state.close()
-            pidfile.release()
+                    startup_task = asyncio.create_task(_startup_sync())
+
+                sync_task = asyncio.create_task(sync_manager.run_forever(cancel_event))
+
+            log.info(
+                "connector.lifespan.up",
+                run_mode=settings.run_mode.value,
+                sync_active=sync_task is not None,
+                webhook_mounted=settings.run_mode is not RunMode.POLL and bool(webhook_handlers),
+            )
+
+            try:
+                yield
+            finally:
+                cancel_event.set()
+                for task in (sync_task, startup_task):
+                    if task is not None:
+                        task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await task
 
     app = FastAPI(
         title=f"IronRAG connector — {adapter.name}",
@@ -236,7 +240,7 @@ def _mount_webhook(
         _require_admin_bearer(settings, request)
         if handler.extra_auth is not None:
             handler.extra_auth(request, body)
-        routing_reloader.reload_if_changed()
+        await routing_reloader.reload_if_changed()
         try:
             import json
 

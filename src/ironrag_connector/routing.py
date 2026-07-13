@@ -6,8 +6,7 @@ Routing config schema
 ::
 
     default:
-      workspace: <uuid>
-      library:   <uuid>
+      library: <workspace-slug>/<library-slug>
 
     rules:
       - description: "Free text for logs"
@@ -15,8 +14,7 @@ Routing config schema
           shelf: engineering        # exact string equality
           tag: archive              # if fact is a list/tuple, membership
         target:
-          workspace: <uuid>         # optional; falls back to default.workspace
-          library:   <uuid>
+          library: <workspace-slug>/<library-slug>
 
     policies:                       # optional per-kind overrides
       page:
@@ -35,14 +33,15 @@ is recorded as ``unrouted`` and skipped (logged loudly).
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import asyncio
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .observability import get_logger
 from .policy import (
@@ -58,12 +57,20 @@ from .source import SourceItemRef
 log = get_logger(__name__)
 
 
-class RouteTarget(BaseModel):
-    workspace: UUID | None = None
-    library: UUID
+class StrictRoutingModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 
-class RouteRule(BaseModel):
+class RouteTarget(StrictRoutingModel):
+    library: str
+
+    @field_validator("library")
+    @classmethod
+    def _canonical_library_ref(cls, value: str) -> str:
+        return normalize_library_ref(value)
+
+
+class RouteRule(StrictRoutingModel):
     description: str | None = None
     match: dict[str, Any]
     target: RouteTarget
@@ -76,12 +83,11 @@ class RouteRule(BaseModel):
         return v
 
 
-class DefaultRoute(BaseModel):
-    workspace: UUID
-    library: UUID
+class DefaultRoute(RouteTarget):
+    pass
 
 
-class PolicyOverrideModel(BaseModel):
+class PolicyOverrideModel(StrictRoutingModel):
     on_new: UpsertAction | None = None
     on_changed: UpdateAction | None = None
     on_missing: DeleteAction | None = None
@@ -96,30 +102,24 @@ class PolicyOverrideModel(BaseModel):
         )
 
 
-class RoutingConfig(BaseModel):
+class RoutingConfig(StrictRoutingModel):
     default: DefaultRoute | None = None
     rules: list[RouteRule] = Field(default_factory=list)
     policies: dict[str, PolicyOverrideModel] = Field(default_factory=dict)
 
-    @field_validator("rules")
-    @classmethod
-    def _rules_target_workspace_or_default(
-        cls, rules: list[RouteRule], info: Any
-    ) -> list[RouteRule]:
-        default_present = info.data.get("default") is not None
-        for idx, rule in enumerate(rules):
-            if rule.target.workspace is None and not default_present:
-                raise ValueError(
-                    f"rules[{idx}].target.workspace omitted but no `default.workspace` "
-                    "is configured to inherit from"
-                )
-        return rules
+
+@dataclass(frozen=True)
+class ResolvedLibraryTarget:
+    library_ref: str
+    workspace_id: UUID
+    library_id: UUID
+
+
+LibraryResolver = Callable[[set[str]], Awaitable[Mapping[str, ResolvedLibraryTarget]]]
 
 
 @dataclass(frozen=True)
-class ResolvedRoute:
-    workspace_id: UUID
-    library_id: UUID
+class ResolvedRoute(ResolvedLibraryTarget):
     rule_description: str
     """Empty string means the default route was used."""
 
@@ -139,6 +139,19 @@ class RoutingError(RuntimeError):
     """Thrown when neither a rule nor a default could resolve an item."""
 
 
+def normalize_library_ref(value: str) -> str:
+    """Validate the MCP-compatible ``<workspace>/<library>`` catalog ref."""
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("library ref must not be empty")
+    if normalized.count("/") != 1:
+        raise ValueError("library ref must use exactly one '<workspace>/<library>' separator")
+    workspace_slug, library_slug = (segment.strip() for segment in normalized.split("/", 1))
+    if not workspace_slug or not library_slug:
+        raise ValueError("library ref must use non-empty '<workspace>/<library>' slugs")
+    return f"{workspace_slug}/{library_slug}"
+
+
 def load_routing_config(path: Path) -> RoutingConfig:
     if not path.is_file():
         raise FileNotFoundError(f"routing config not found at {path}")
@@ -149,50 +162,67 @@ def load_routing_config(path: Path) -> RoutingConfig:
 
 
 class Router:
-    """Resolve a SourceItemRef to a (workspace, library) target."""
+    """Resolve source facts through a catalog-compiled routing snapshot."""
 
-    def __init__(self, config: RoutingConfig) -> None:
+    def __init__(
+        self,
+        config: RoutingConfig,
+        *,
+        resolved_targets: Mapping[str, ResolvedLibraryTarget] | None = None,
+    ) -> None:
         self._config = config
+        self._resolved_targets: dict[str, ResolvedLibraryTarget] | None = None
+        if resolved_targets is not None:
+            self._resolved_targets = _validate_resolved_targets(config, resolved_targets)
 
-    def replace_config(self, config: RoutingConfig) -> None:
-        """Swap routing rules in-place so existing users see the new config."""
+    async def initialize(self, resolver: LibraryResolver) -> None:
+        """Resolve the complete configured snapshot before routing any item."""
+        self._resolved_targets = await _resolve_targets(self._config, resolver)
+
+    def replace_config(
+        self,
+        config: RoutingConfig,
+        resolved_targets: Mapping[str, ResolvedLibraryTarget],
+    ) -> None:
+        """Atomically swap a fully resolved routing snapshot."""
+        validated = _validate_resolved_targets(config, resolved_targets)
         self._config = config
+        self._resolved_targets = validated
+
+    def target_library_refs(self) -> set[str]:
+        return _configured_library_refs(self._config)
 
     def target_libraries(self) -> set[UUID]:
-        libs: set[UUID] = set()
-        if self._config.default:
-            libs.add(self._config.default.library)
-        for rule in self._config.rules:
-            libs.add(rule.target.library)
-        return libs
+        targets = self._require_resolved_targets()
+        return {target.library_id for target in targets.values()}
 
     def resolve(self, ref: SourceItemRef) -> ResolvedRoute:
         facts = ref.routing_facts or {}
         for rule in self._config.rules:
             if _facts_match(rule.match, facts):
-                workspace = rule.target.workspace or (
-                    self._config.default.workspace if self._config.default else None
-                )
-                if workspace is None:
-                    raise RoutingError(
-                        f"rule '{rule.description or '<unnamed>'}' matched item "
-                        f"{ref.kind}:{ref.item_id} but neither rule.target.workspace "
-                        "nor default.workspace is set"
-                    )
-                return ResolvedRoute(
-                    workspace_id=workspace,
-                    library_id=rule.target.library,
-                    rule_description=rule.description or "<unnamed rule>",
+                return self._resolved_route(
+                    rule.target.library,
+                    rule.description or "<unnamed rule>",
                 )
         if self._config.default is None:
-            raise RoutingError(
-                f"no rule matched {ref.kind}:{ref.item_id} and no default is set"
-            )
+            raise RoutingError(f"no rule matched {ref.kind}:{ref.item_id} and no default is set")
+        return self._resolved_route(self._config.default.library, "")
+
+    def _resolved_route(self, library_ref: str, description: str) -> ResolvedRoute:
+        target = self._require_resolved_targets().get(library_ref)
+        if target is None:
+            raise RoutingError(f"library ref '{library_ref}' is not resolved")
         return ResolvedRoute(
-            workspace_id=self._config.default.workspace,
-            library_id=self._config.default.library,
-            rule_description="",
+            library_ref=target.library_ref,
+            workspace_id=target.workspace_id,
+            library_id=target.library_id,
+            rule_description=description,
         )
+
+    def _require_resolved_targets(self) -> dict[str, ResolvedLibraryTarget]:
+        if self._resolved_targets is None:
+            raise RoutingError("routing catalog targets are not resolved")
+        return self._resolved_targets
 
     def build_policies(self, defaults: PushPolicy) -> PolicyOverrides:
         by_kind = {
@@ -212,14 +242,21 @@ class RoutingReloader:
         router: Router,
         policies: PolicyOverrides,
         defaults: PushPolicy,
+        resolver: LibraryResolver,
     ) -> None:
         self._path = path
         self._router = router
         self._policies = policies
         self._defaults = defaults
+        self._resolver = resolver
         self._mtime_ns = _mtime_ns(path)
+        self._reload_lock = asyncio.Lock()
 
-    def reload_if_changed(self) -> bool:
+    async def reload_if_changed(self) -> bool:
+        async with self._reload_lock:
+            return await self._reload_if_changed_locked()
+
+    async def _reload_if_changed_locked(self) -> bool:
         try:
             current_mtime_ns = _mtime_ns(self._path)
         except OSError as exc:
@@ -234,6 +271,7 @@ class RoutingReloader:
             return False
         try:
             config = load_routing_config(self._path)
+            resolved_targets = await _resolve_targets(config, self._resolver)
         except Exception as exc:
             log.error(
                 "routing.reload_error",
@@ -242,7 +280,7 @@ class RoutingReloader:
                 error=str(exc) or repr(exc),
             )
             return False
-        self._router.replace_config(config)
+        self._router.replace_config(config, resolved_targets)
         updated = self._router.build_policies(self._defaults)
         self._policies.default = updated.default
         self._policies.by_kind = updated.by_kind
@@ -269,6 +307,44 @@ def _facts_match(criteria: dict[str, Any], facts: dict[str, Any]) -> bool:
             if actual != expected:
                 return False
     return True
+
+
+def _configured_library_refs(config: RoutingConfig) -> set[str]:
+    refs = {rule.target.library for rule in config.rules}
+    if config.default is not None:
+        refs.add(config.default.library)
+    return refs
+
+
+async def _resolve_targets(
+    config: RoutingConfig,
+    resolver: LibraryResolver,
+) -> dict[str, ResolvedLibraryTarget]:
+    refs = _configured_library_refs(config)
+    resolved = await resolver(refs)
+    return _validate_resolved_targets(config, resolved)
+
+
+def _validate_resolved_targets(
+    config: RoutingConfig,
+    targets: Mapping[str, ResolvedLibraryTarget],
+) -> dict[str, ResolvedLibraryTarget]:
+    expected = _configured_library_refs(config)
+    actual = set(targets)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        raise RoutingError(
+            "catalog resolver returned an incomplete snapshot "
+            f"(missing={missing}, unexpected={unexpected})"
+        )
+    result = dict(targets)
+    for library_ref, target in result.items():
+        if target.library_ref != library_ref:
+            raise RoutingError(
+                f"catalog resolver returned '{target.library_ref}' for '{library_ref}'"
+            )
+    return result
 
 
 def known_kinds(rules: Iterable[RouteRule]) -> set[str]:

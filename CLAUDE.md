@@ -28,7 +28,8 @@ The framework owns:
 - **HTTP client** against IronRAG (`upload`, `replace`, `delete`,
   `find_by_external_key`, `list_by_prefix`).
 - **Routing** — YAML rules mapping arbitrary adapter-emitted facts
-  (`shelf`, `tag`, `space`, …) to `(workspace_id, library_id)`.
+  (`shelf`, `tag`, `space`, …) to canonical
+  `workspace-slug/library-slug` refs, compiled to internal IDs at startup.
 - **Per-kind push policy** — `on_new` / `on_changed` / `on_missing` /
   `on_duplicate_content`, each independently configurable. Lets ops
   treat pages, attachments, and images differently in one connector.
@@ -86,7 +87,8 @@ docs/ARCHITECTURE.md         — lifecycle diagram + failure modes
 
 1. `iter_items()` yields `SourceItemRef` (id + kind + external_key +
    change_token + routing_facts).
-2. `Router.resolve(ref)` returns `(workspace, library)`.
+2. Startup resolves every canonical routing ref through IronRAG's catalog;
+   `Router.resolve(ref)` returns the compiled internal target.
 3. `Orchestrator.push_ref(ref)` reads cursor: if `change_token`
    unchanged AND cursor knows doc_id → `noop_unchanged`, no HTTP call.
 4. Else `adapter.fetch(ref)` returns the full `SourceItem`.

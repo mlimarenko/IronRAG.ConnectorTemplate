@@ -9,7 +9,12 @@ import pytest
 
 from ironrag_connector.orchestrator import OrchestrationOutcome
 from ironrag_connector.policy import PushPolicy
-from ironrag_connector.routing import PolicyOverrides, Router, RoutingConfig
+from ironrag_connector.routing import (
+    PolicyOverrides,
+    ResolvedLibraryTarget,
+    Router,
+    RoutingConfig,
+)
 from ironrag_connector.source import SourceItemRef
 from ironrag_connector.state import StateStore
 from ironrag_connector.sync import SyncAlreadyRunningError, SyncManager
@@ -97,7 +102,7 @@ class CountingReloader:
     def __init__(self) -> None:
         self.calls = 0
 
-    def reload_if_changed(self) -> bool:
+    async def reload_if_changed(self) -> bool:
         self.calls += 1
         return False
 
@@ -118,10 +123,16 @@ class BlockingOrchestrator(NoopOrchestrator):
 
 
 def _router() -> Router:
+    library_ref = "tests/default-library"
     return Router(
-        RoutingConfig.model_validate(
-            {"default": {"workspace": str(WS), "library": str(LIB)}}
-        )
+        RoutingConfig.model_validate({"default": {"library": library_ref}}),
+        resolved_targets={
+            library_ref: ResolvedLibraryTarget(
+                library_ref=library_ref,
+                workspace_id=WS,
+                library_id=LIB,
+            )
+        },
     )
 
 

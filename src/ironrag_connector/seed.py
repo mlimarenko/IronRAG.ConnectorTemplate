@@ -37,6 +37,7 @@ from uuid import UUID
 import httpx
 
 from .config import BaseConnectorSettings
+from .ironrag import IronRagClient
 from .observability import configure_logging, get_logger
 from .routing import Router, load_routing_config
 from .source import SourceAdapter
@@ -45,29 +46,30 @@ from .state import StateStore
 log = get_logger(__name__)
 
 
-async def _seed_async(
-    settings: BaseConnectorSettings, adapter: SourceAdapter
-) -> dict[str, int]:
+async def _seed_async(settings: BaseConnectorSettings, adapter: SourceAdapter) -> dict[str, int]:
     router = Router(load_routing_config(settings.routing_config_path))
     state = StateStore(settings.state_db_path)
     counts: dict[str, int] = {"libraries": 0, "docs_scanned": 0, "rows_inserted": 0}
 
-    async with httpx.AsyncClient(
-        base_url=settings.ironrag_base_url.rstrip("/"),
-        timeout=settings.request_timeout_seconds,
-        headers={"Authorization": f"Bearer {settings.ironrag_api_token}"},
-    ) as client:
-        for library_id in router.target_libraries():
-            counts["libraries"] += 1
-            log.info("seed.library.start", library_id=str(library_id))
-            await _seed_library(library_id, client, adapter, state, counts)
-            log.info(
-                "seed.library.done",
-                library_id=str(library_id),
-                rows_inserted=counts["rows_inserted"],
-            )
-
-    state.close()
+    try:
+        async with httpx.AsyncClient(
+            base_url=settings.ironrag_base_url.rstrip("/"),
+            timeout=settings.request_timeout_seconds,
+            headers={"Authorization": f"Bearer {settings.ironrag_api_token}"},
+        ) as client:
+            ironrag = IronRagClient(settings, client=client)
+            await router.initialize(ironrag.resolve_library_refs)
+            for library_id in router.target_libraries():
+                counts["libraries"] += 1
+                log.info("seed.library.start", library_id=str(library_id))
+                await _seed_library(library_id, client, adapter, state, counts)
+                log.info(
+                    "seed.library.done",
+                    library_id=str(library_id),
+                    rows_inserted=counts["rows_inserted"],
+                )
+    finally:
+        state.close()
     return counts
 
 
@@ -100,9 +102,7 @@ async def _seed_library(
             )
             return
         payload = resp.json()
-        items: list[dict[str, Any]] = (
-            payload.get("items") or payload.get("documents") or []
-        )
+        items: list[dict[str, Any]] = payload.get("items") or payload.get("documents") or []
         if not items:
             return
 
@@ -138,9 +138,7 @@ async def _seed_library(
             return
 
 
-def seed_cursor(
-    settings: BaseConnectorSettings, adapter: SourceAdapter
-) -> dict[str, int]:
+def seed_cursor(settings: BaseConnectorSettings, adapter: SourceAdapter) -> dict[str, int]:
     """Synchronous wrapper for use from a connector's ``main`` script.
 
     Returns a counts dict: ``libraries``, ``docs_scanned``,
