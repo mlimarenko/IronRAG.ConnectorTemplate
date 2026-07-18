@@ -10,7 +10,7 @@ from .adapter import EchoAdapter, EchoPage
 
 
 def main() -> None:
-    settings = BaseConnectorSettings()  # type: ignore[call-arg]
+    settings = BaseConnectorSettings()
     pages = {
         "hello": EchoPage(
             item_id="hello",

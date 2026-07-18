@@ -40,3 +40,4 @@ venv/
 
 # Operator-specific config (only the .example is public)
 routing.yaml
+.claude/

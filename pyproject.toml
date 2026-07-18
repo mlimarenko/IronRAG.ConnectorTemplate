@@ -1,6 +1,6 @@
 [project]
 name = "ironrag-connector"
-version = "0.1.0"
+version = "0.2.0"
 description = "Framework for building data-source connectors that push content into IronRAG."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -48,6 +48,8 @@ python_version = "3.12"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
+plugins = ["pydantic.mypy"]
+mypy_path = "examples/echo_connector/src"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

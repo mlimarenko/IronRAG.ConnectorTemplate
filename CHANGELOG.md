@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.2.0 — 2026-07-18
+
+- **Breaking:** rewrote `IronRagClient` for the redesigned IronRAG REST v2
+  content API. Documents are created with `create_document`
+  (`POST /v1/content/libraries/{libraryId}/documents`, `201` + `Location`),
+  revised with `create_revision`
+  (`POST /v1/content/documents/{documentId}/revisions`, `202` + operation),
+  and looked up with `find_document` / `list_documents` /
+  `walk_all_documents`. The former `upload_document`, `replace_document`,
+  `find_document_by_external_key`, and
+  `list_documents_by_external_key_prefix` methods are gone.
+- Asynchronous mutations now return a typed `OperationHandle` polled to a
+  terminal state with the SDK's single `wait_for_operation` primitive
+  (`GET /v1/ops/operations/{operationId}`); the poll cadence and budget are
+  the new `operation_poll_interval_seconds` and
+  `operation_poll_budget_seconds` settings.
+- Typed responses and errors throughout: `DocumentResource`, `DocumentPage`,
+  `OperationStatus`, and an RFC 9457 problem-details error family
+  (`IronRagProblemError`, `IronRagNotFoundError`, `IronRagConflictError`,
+  `IronRagDuplicateContentError` with `existing_document_id`,
+  `IronRagOperationFailedError`, `IronRagMutationTimeoutError`) replace
+  dict payloads and string matching.
+- **Breaking:** removed the legacy cursor-migration subsystem and its
+  `cursor_library_lookup_timeout_seconds` /
+  `cursor_library_lookup_max_rows_per_sweep` settings; cursor rows are
+  created with a non-null library binding from the start. The
+  `ironrag_mutation_timeout_seconds` setting is superseded by the operation
+  poll budget.
+- Added `rewalk_concurrency` to bound post-upgrade full re-walks driven by
+  `walk_all_documents`.
+- Orchestrator create/revise flows, the seeder, and the reaper now ride the
+  new typed client; route-move reaping keeps working via a pre-sweep
+  cursor-library snapshot.
+- Bumped the package version to 0.2.0.
+
 ## 0.1.0 — 2026-07-14
 
 - Replaced UUID routing targets with canonical, human-readable

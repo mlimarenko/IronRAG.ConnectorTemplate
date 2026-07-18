@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import pytest
 
+from ironrag_connector.ironrag import DocumentResource
 from ironrag_connector.orchestrator import OrchestrationOutcome
 from ironrag_connector.policy import PushPolicy
 from ironrag_connector.routing import (
@@ -58,12 +60,11 @@ class OneRefAdapter(EmptyBlockingAdapter):
 
 
 class FakeIronRag:
-    async def list_documents_by_external_key_prefix(
-        self, *_: Any, **__: Any
-    ) -> list[tuple[str, str]]:
-        return []
+    async def list_documents(self, *_: Any, **__: Any) -> AsyncIterator[DocumentResource]:
+        return
+        yield  # pragma: no cover -- makes this an async generator
 
-    async def get_document(self, *_: Any, **__: Any) -> dict[str, Any] | None:
+    async def get_document(self, *_: Any, **__: Any) -> DocumentResource | None:
         return None
 
 
@@ -71,12 +72,11 @@ class SlowListIronRag(FakeIronRag):
     def __init__(self) -> None:
         self.started = asyncio.Event()
 
-    async def list_documents_by_external_key_prefix(
-        self, *_: Any, **__: Any
-    ) -> list[tuple[str, str]]:
+    async def list_documents(self, *_: Any, **__: Any) -> AsyncIterator[DocumentResource]:
         self.started.set()
         await asyncio.Event().wait()
         raise AssertionError("slow reaper list should time out")
+        yield  # pragma: no cover -- makes this an async generator
 
 
 class NoopOrchestrator:

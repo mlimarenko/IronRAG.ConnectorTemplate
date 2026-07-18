@@ -43,6 +43,7 @@ rules:
     settings = BaseConnectorSettings(
         ironrag_base_url="http://ironrag.example.com",
         ironrag_api_token="test-token",
+        request_timeout_seconds=60.0,
         routing_config_path=routing,
         state_db_path=tmp_path / "state.sqlite",
     )
@@ -62,8 +63,8 @@ rules:
         ],
     )
     httpx_mock.add_response(
-        url=f"http://ironrag.example.com/v1/content/documents?libraryId={LIB}&limit=200&offset=0",
-        json={"items": []},
+        url=f"http://ironrag.example.com/v1/content/libraries/{LIB}/documents?limit=200",
+        json={"items": [], "nextCursor": None},
     )
 
     counts = await _seed_async(settings, SeedAdapter())  # type: ignore[arg-type]
@@ -73,6 +74,6 @@ rules:
     assert [request.url.path for request in requests] == [
         "/v1/catalog/workspaces",
         f"/v1/catalog/workspaces/{WS}/libraries",
-        "/v1/content/documents",
+        f"/v1/content/libraries/{LIB}/documents",
     ]
     assert all(request.headers["Authorization"] == "Bearer test-token" for request in requests)

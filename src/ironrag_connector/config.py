@@ -77,28 +77,24 @@ class BaseConnectorSettings(BaseSettings):
     ironrag_base_url: str
     ironrag_api_token: str
     request_timeout_seconds: float = Field(60.0, ge=1.0)
-    ironrag_mutation_timeout_seconds: float | None = Field(default=None, ge=1.0)
-    """Timeout for IronRAG write-admission requests.
+    operation_poll_interval_seconds: float = Field(default=1.0, ge=0.05)
+    """Delay between polls in :meth:`IronRagClient.wait_for_operation`.
 
-    Defaults to the smaller of ``REQUEST_TIMEOUT_SECONDS`` and
-    ``SYNC_ITEM_TIMEOUT_SECONDS - 5s``. This keeps upload/replace/delete
-    admissions inside the per-item budget while leaving read/list requests
-    free to use the broader generic HTTP timeout.
+    Every asynchronous mutation (revision, delete) is a 202 + Location to
+    ``/v1/ops/operations/{id}``; this is the interval the SDK's one
+    poll-to-terminal primitive sleeps between polls.
     """
-    cursor_library_lookup_timeout_seconds: float = Field(default=5.0, ge=0.1)
-    """Timeout for best-effort legacy cursor library lookups.
-
-    Keep this separate from ``request_timeout_seconds``: uploads may need a
-    generous timeout, but one metadata lookup must not block a whole sweep.
-    """
-    cursor_library_lookup_max_rows_per_sweep: int = Field(default=16, ge=0)
-    """Maximum legacy cursor rows to backfill before source enumeration.
-
-    Rows beyond this limit are left for per-item lazy resolution or a later
-    sweep, which keeps large old cursors from delaying the sync hot path.
-    """
+    operation_poll_budget_seconds: float = Field(default=120.0, ge=1.0)
+    """Maximum wall-clock time :meth:`IronRagClient.wait_for_operation` polls
+    before raising ``IronRagMutationTimeoutError``. Distinct from
+    ``sync_item_timeout_seconds``: an item's overall budget also covers
+    routing, fetch, and dependents, not just the one operation poll."""
+    rewalk_concurrency: int = Field(default=4, ge=1, le=64)
+    """Fan-out bound for a post-upgrade full re-walk driven by
+    :meth:`IronRagClient.walk_all_documents`. Confirm against each source
+    system's documented rate limit before the first production re-walk."""
     reaper_list_timeout_seconds: float = Field(default=30.0, ge=1.0)
-    """Maximum time for one IronRAG reaper prefix-list request.
+    """Maximum time for one IronRAG reaper document-list request.
 
     Reaping runs after item enumeration, outside the per-item timeout. This
     bound prevents a slow document listing endpoint from holding the whole

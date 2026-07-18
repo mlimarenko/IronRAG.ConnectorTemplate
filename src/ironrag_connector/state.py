@@ -14,8 +14,8 @@ SQLite over JSON
 
 JSON is fine until two writers touch the file at once (multi-worker
 deployments, manual /sync/run hitting a sweep already in progress).
-SQLite gives us atomic upsert at zero ops cost — single file, no daemon,
-fsync per write — at the price of one extra dependency line in
+SQLite gives us atomic upsert at zero ops cost -- single file, no daemon,
+fsync per write -- at the price of one extra dependency line in
 ``pyproject.toml`` (already part of the stdlib).
 
 Schema
@@ -29,14 +29,19 @@ Schema
         change_token TEXT,
         external_key TEXT NOT NULL,
         ironrag_document_id TEXT,
-        ironrag_library_id TEXT,
+        ironrag_library_id TEXT NOT NULL,
         last_pushed_at TEXT NOT NULL,
         PRIMARY KEY (kind, item_id)
     );
 
 The composite primary key matches the framework's identity model:
 ``(kind, item_id)`` is unique within a connector and small enough to
-walk for the reaper pass.
+walk for the reaper pass. ``ironrag_library_id`` is ``NOT NULL`` from
+schema creation: the redesigned client's create/find/list calls are all
+scoped by an already-known ``library_id`` (routing resolves it before
+any IronRAG call), so every cursor row is written with both the document
+id and its owning library together -- there is no longer a "document id
+known, library unknown" state to represent, migrate, or backfill.
 """
 
 from __future__ import annotations
@@ -57,7 +62,7 @@ class CursorRow:
     change_token: str | None
     external_key: str
     ironrag_document_id: str | None
-    ironrag_library_id: str | None
+    ironrag_library_id: str
     last_pushed_at: str
 
 
@@ -71,7 +76,7 @@ class StateStore:
         change_token TEXT,
         external_key TEXT NOT NULL,
         ironrag_document_id TEXT,
-        ironrag_library_id TEXT,
+        ironrag_library_id TEXT NOT NULL,
         last_pushed_at TEXT NOT NULL,
         PRIMARY KEY (kind, item_id)
     );
@@ -92,7 +97,6 @@ class StateStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(self._SCHEMA)
-        self._migrate()
 
     def close(self) -> None:
         with self._lock:
@@ -139,7 +143,7 @@ class StateStore:
         change_token: str | None,
         external_key: str,
         ironrag_document_id: str | None,
-        ironrag_library_id: str | None = None,
+        ironrag_library_id: str,
     ) -> None:
         now = datetime.now(tz=UTC).isoformat()
         with self._cursor() as cur:
@@ -156,10 +160,7 @@ class StateStore:
                         excluded.ironrag_document_id,
                         cursor.ironrag_document_id
                     ),
-                    ironrag_library_id = COALESCE(
-                        excluded.ironrag_library_id,
-                        cursor.ironrag_library_id
-                    ),
+                    ironrag_library_id = excluded.ironrag_library_id,
                     last_pushed_at = excluded.last_pushed_at
                 """,
                 (
@@ -179,18 +180,19 @@ class StateStore:
         kind: str,
         item_id: str,
         external_key: str,
-        ironrag_document_id: str | None,
-        ironrag_library_id: str | None,
+        ironrag_document_id: str,
+        ironrag_library_id: str,
     ) -> None:
-        """Persist discovered IronRAG ownership without advancing source state."""
+        """Persist a discovered IronRAG document id without advancing source
+        state (``change_token``/``last_pushed_at`` are left untouched)."""
         with self._cursor() as cur:
             cur.execute(
                 """
                 UPDATE cursor
                 SET
                     external_key = ?,
-                    ironrag_document_id = COALESCE(?, ironrag_document_id),
-                    ironrag_library_id = COALESCE(?, ironrag_library_id)
+                    ironrag_document_id = ?,
+                    ironrag_library_id = ?
                 WHERE kind = ? AND item_id = ?
                 """,
                 (
@@ -250,10 +252,3 @@ class StateStore:
                 (kind,),
             ).fetchall()
         return [CursorRow(*r) for r in rows]
-
-    def _migrate(self) -> None:
-        """Add columns introduced after early cursor databases were created."""
-        with self._cursor() as cur:
-            columns = {row[1] for row in cur.execute("PRAGMA table_info(cursor)")}
-            if "ironrag_library_id" not in columns:
-                cur.execute("ALTER TABLE cursor ADD COLUMN ironrag_library_id TEXT")

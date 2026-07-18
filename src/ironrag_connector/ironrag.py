@@ -1,44 +1,61 @@
-"""Async IronRAG content-mutation client.
+"""Async IronRAG content client — targets the redesigned `/v1` REST surface.
 
 Endpoints
 =========
 
-The connector talks to the following IronRAG endpoints:
-
 * ``GET /v1/catalog/workspaces`` and
   ``GET /v1/catalog/workspaces/{id}/libraries`` — resolve canonical
   ``workspace-slug/library-slug`` routing refs once per routing snapshot.
-* ``GET /v1/content/documents?libraryId=&externalKey=`` — find an existing
-  document by the canonical external key the adapter coined.
-* ``POST /v1/content/documents/upload`` (multipart) — create a new document.
-* ``POST /v1/content/documents/{id}/replace`` (multipart) — replace bytes
-  on an existing document.
-* ``DELETE /v1/content/documents/{id}`` — soft-delete a document.
+  Unaffected by the content-domain redesign.
+* ``GET /v1/content/libraries/{libraryId}/documents`` — the single
+  read-collection interface: cursor pagination, ``search`` (a
+  case-insensitive substring/ILIKE filter on ``external_key`` only --
+  there is no dedicated exact-match filter), ``includeDeleted``,
+  ``status``. Backs both :meth:`IronRagClient.find_document` and
+  :meth:`IronRagClient.list_documents`; both reconstruct an exact-key
+  lookup by passing the key as ``search`` and filtering the (typically
+  single) page of matches client-side for an exact ``externalKey``
+  equality, since ``search`` narrows on the same column.
+* ``POST /v1/content/libraries/{libraryId}/documents`` — content-negotiated
+  create (``application/json`` for metadata/pointer documents,
+  ``multipart/form-data`` for byte uploads). Synchronous: 201 + Location.
+* ``POST /v1/content/documents/{id}/revisions`` — content-negotiated
+  revision (JSON ``{mode: "append"|"replace"}`` for text, multipart for a
+  file replace). Asynchronous: 202 + ``Location`` to the canonical
+  ``/v1/ops/operations/{operationId}``.
+* ``DELETE /v1/content/documents/{id}`` — asynchronous in effect (always
+  creates an ``ops_async_operation`` row to poll), but returns a plain
+  200 with the operation id in the JSON body rather than 202 + Location
+  like revisions. Handled uniformly through the same typed body field.
+* ``GET /v1/content/documents/{id}`` — single document detail.
+* ``GET /v1/ops/operations/{operationId}`` — the canonical poll target
+  for every asynchronous mutation. :meth:`IronRagClient.wait_for_operation`
+  is the one poll-to-terminal primitive every mutating call funnels
+  through.
 
-Workspace and library are passed per call, so a single connector instance
-can drive many IronRAG libraries from one process.
+Errors
+======
 
-Duplicate-content handling
-==========================
-
-When IronRAG returns 409 with ``errorKind == "conflict"`` and an error
-message starting with ``"conflict: duplicate content"``, ``upload_document``
-returns a sentinel dict instead of raising::
-
-    {"document": {"id": "<existing-uuid-or-None>"}, "duplicate_of_existing": True}
-
-The orchestrator detects ``duplicate_of_existing=True`` and applies the
-``on_duplicate_content`` policy for the item's ``kind`` (skip vs fail).
+Every non-2xx response is RFC 9457 ``application/problem+json``:
+``{type, title, status, detail, code, requestId?, ...extensions}``, with
+extension members (e.g. ``existingDocumentId`` on a 409 duplicate-content
+conflict) flattened at the top level rather than nested. Error handling
+here is entirely typed field access — no regex or substring sniffing of
+error messages.
 """
 
 from __future__ import annotations
 
-import re
-from collections.abc import Mapping, Sequence
-from typing import Any
+import asyncio
+import time
+from collections.abc import AsyncIterator, Mapping, Sequence
+from datetime import datetime
+from enum import StrEnum
+from typing import Any, Literal, Protocol
 from uuid import UUID
 
 import httpx
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from .config import BaseConnectorSettings
 from .observability import get_logger
@@ -46,10 +63,151 @@ from .routing import ResolvedLibraryTarget, normalize_library_ref
 
 log = get_logger(__name__)
 
-_EXISTING_DOC_RE = re.compile(
-    r"document\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
-    re.IGNORECASE,
-)
+DEFAULT_REWALK_CONCURRENCY = 4
+"""Conservative default fan-out for a post-upgrade full re-walk (S7.6).
+
+Bounds how many in-flight create/revision calls a caller issues while
+consuming :meth:`IronRagClient.walk_all_documents` or driving a sweep --
+this module never fetches list pages concurrently (cursor pagination is
+inherently sequential; page N+1 needs page N's cursor). Operators should
+confirm this default against each source system's documented rate limit
+before the first production re-walk (plan S7.6/S9 step 2).
+"""
+
+
+# ---------------------------------------------------------------------------
+# Typed response models
+# ---------------------------------------------------------------------------
+
+
+class DocumentResource(BaseModel):
+    """One document as returned by list/find/get/create.
+
+    The list endpoint (``ContentDocumentListItem``) and the get/create
+    endpoints (``ContentDocumentDetailResponse``, unwrapped by
+    :func:`_extract_document_payload`) are genuinely different response
+    shapes, not just naming drift: the list row carries a derived
+    ``status`` bucket (``queued``/``processing``/``ready``/``failed``/
+    ``canceled``), while the detail/create row instead carries the raw
+    ``documentState`` lifecycle value (``active``/``deleted``) with no
+    ``status`` field at all. ``status`` accepts either source key so one
+    model can populate from both surfaces; a value from ``documentState``
+    is the raw lifecycle state, not the derived status bucket -- callers
+    that need the canonical bucket must go through :meth:`IronRagClient.
+    list_documents`/:meth:`~IronRagClient.find_document`, not
+    :meth:`~IronRagClient.get_document`/:meth:`~IronRagClient.create_document`.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    id: UUID
+    library_id: UUID = Field(alias="libraryId")
+    workspace_id: UUID | None = Field(default=None, alias="workspaceId")
+    external_key: str = Field(alias="externalKey")
+    status: str | None = Field(
+        default=None, validation_alias=AliasChoices("status", "documentState")
+    )
+    file_name: str | None = Field(default=None, alias="fileName")
+    document_hint: str | None = Field(default=None, alias="documentHint")
+    uploaded_at: datetime | None = Field(default=None, alias="uploadedAt")
+
+
+class DocumentPage(BaseModel):
+    """One cursor page from ``GET .../documents``."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    items: list[DocumentResource] = Field(default_factory=list)
+    next_cursor: str | None = Field(default=None, alias="nextCursor")
+    total: int | None = None
+
+
+class OperationStatusValue(StrEnum):
+    """Canonical ``ops_async_operation.status`` values (server-authoritative)."""
+
+    ACCEPTED = "accepted"
+    PROCESSING = "processing"
+    READY = "ready"
+    FAILED = "failed"
+    SUPERSEDED = "superseded"
+    CANCELED = "canceled"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in (
+            OperationStatusValue.READY,
+            OperationStatusValue.FAILED,
+            OperationStatusValue.SUPERSEDED,
+            OperationStatusValue.CANCELED,
+        )
+
+
+class OperationProgress(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    total: int = 0
+    completed: int = 0
+    failed: int = 0
+    in_flight: int = Field(default=0, alias="inFlight")
+
+
+class OperationStatus(BaseModel):
+    """``GET /v1/ops/operations/{operationId}`` response body.
+
+    The server's ``AsyncOperationDetailResponse`` applies
+    ``#[serde(flatten)]`` to its ``OpsAsyncOperation`` row -- the row's
+    fields (``id``, ``workspaceId``, ``operationKind``, ``status``, ...)
+    sit directly at the top level of the JSON object, as siblings of
+    ``progress``, not nested under an ``"operation"`` key. This model
+    mirrors that flattened shape; there is no separate ``AsyncOperation``
+    wrapper type.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    id: UUID
+    workspace_id: UUID = Field(alias="workspaceId")
+    library_id: UUID | None = Field(default=None, alias="libraryId")
+    operation_kind: str = Field(alias="operationKind")
+    status: OperationStatusValue
+    failure_code: str | None = Field(default=None, alias="failureCode")
+    created_at: datetime = Field(alias="createdAt")
+    completed_at: datetime | None = Field(default=None, alias="completedAt")
+    progress: OperationProgress
+
+
+class OperationHandle(BaseModel):
+    """202-Accepted admission: the operation id to poll to terminal."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    operation_id: UUID
+
+
+class ProblemDetails(BaseModel):
+    """RFC 9457 ``application/problem+json`` error body.
+
+    Known extension members (currently just ``existingDocumentId`` on the
+    document-create duplicate-content conflict) are declared as typed
+    optional fields; ``extra="allow"`` preserves any other extension
+    losslessly on ``model_extra`` without the client needing to know about
+    it ahead of time.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    type: str
+    title: str
+    status: int
+    detail: str
+    code: str
+    request_id: str | None = Field(default=None, alias="requestId")
+    existing_document_id: UUID | None = Field(default=None, alias="existingDocumentId")
+
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
 
 
 class IronRagError(RuntimeError):
@@ -61,7 +219,125 @@ class IronRagCatalogError(IronRagError):
 
 
 class IronRagMutationTimeoutError(IronRagError):
-    """IronRAG write admission did not return inside the connector budget."""
+    """An async operation did not reach a terminal state inside the poll budget."""
+
+
+class IronRagProblemError(IronRagError):
+    """Base class for typed RFC 9457 problem+json errors.
+
+    Carries the fully parsed :class:`ProblemDetails` so callers branch on
+    ``.problem.code`` (and, for the duplicate-content conflict,
+    ``.existing_document_id``) instead of sniffing the message text.
+    """
+
+    def __init__(self, problem: ProblemDetails) -> None:
+        self.problem = problem
+        super().__init__(problem.detail)
+
+
+class IronRagNotFoundError(IronRagProblemError):
+    """404 -- the referenced resource does not exist."""
+
+
+class IronRagDuplicateContentError(IronRagProblemError):
+    """409 ``duplicate_content`` -- an active document with this external key,
+    or identical bytes, already exists. Carries the conflicting document id
+    via the typed ``existingDocumentId`` problem+json extension member."""
+
+    @property
+    def existing_document_id(self) -> UUID | None:
+        return self.problem.existing_document_id
+
+
+class IronRagConflictError(IronRagProblemError):
+    """409 for any conflict other than duplicate content (e.g. a document
+    with a mutation already in flight)."""
+
+
+class IronRagOperationFailedError(IronRagError):
+    """A polled operation reached terminal status ``failed``."""
+
+    def __init__(self, status: OperationStatus) -> None:
+        self.status = status
+        super().__init__(
+            f"operation {status.id} failed"
+            + (f" ({status.failure_code})" if status.failure_code else "")
+        )
+
+
+def _parse_problem(response: httpx.Response) -> ProblemDetails:
+    try:
+        body: Any = response.json()
+    except ValueError:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    body.setdefault("type", "urn:ironrag:error:unknown")
+    body.setdefault("title", "Error")
+    body.setdefault("status", response.status_code)
+    body.setdefault("detail", response.text[:400] or response.reason_phrase)
+    body.setdefault("code", "unknown")
+    return ProblemDetails.model_validate(body)
+
+
+def _raise_for_problem(response: httpx.Response) -> None:
+    problem = _parse_problem(response)
+    if response.status_code == 404:
+        raise IronRagNotFoundError(problem)
+    if response.status_code == 409 and problem.code == "duplicate_content":
+        raise IronRagDuplicateContentError(problem)
+    if response.status_code == 409:
+        raise IronRagConflictError(problem)
+    raise IronRagProblemError(problem)
+
+
+def _extract_document_payload(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Unwrap the ``{"document": ...}`` envelope used by create/get responses.
+
+    Some server responses nest a canonical document object a second level
+    deep (detail responses wrap the storage row inside a richer envelope).
+    Handle one level of that nesting by merging the outer scalar fields
+    (which may carry ``externalKey``/``libraryId`` the inner row omits)
+    under the inner object.
+    """
+    doc = payload.get("document", payload)
+    if isinstance(doc, Mapping) and isinstance(doc.get("document"), Mapping):
+        inner = doc["document"]
+        merged = {**doc, **inner}
+        merged.pop("document", None)
+        return merged
+    return doc if isinstance(doc, Mapping) else payload
+
+
+def _operation_id_from_response(body: Mapping[str, Any]) -> UUID:
+    """Extract the operation id to poll from a mutation-admission body.
+
+    ``ContentMutationDetailResponse`` carries a top-level ``asyncOperationId``
+    on every mutation admission this client issues -- revisions (202
+    Accepted) and deletes alike. Deliberately does NOT key off the
+    ``Location`` header: create-revision sets it (202 + Location to
+    ``/v1/ops/operations/{operationId}``) but delete-document does not (its
+    handler returns a plain 200 with the operation id only in the body,
+    despite carrying the same async-admission semantics) -- reading the
+    typed body field uniformly covers both without the caller needing to
+    know which status/header combination a given mutation kind uses.
+    """
+    raw = body.get("asyncOperationId")
+    if raw is None:
+        raise IronRagError("IronRAG accepted the mutation but returned no operation id")
+    return UUID(str(raw))
+
+
+class WalkCheckpointStore(Protocol):
+    """Injectable checkpoint persistence for :meth:`IronRagClient.walk_all_documents`.
+
+    The connector's own local state store (SQLite cursor) is the intended
+    implementation -- this client has no persistence of its own.
+    """
+
+    def load_cursor(self) -> str | None: ...
+
+    def save_cursor(self, cursor: str | None) -> None: ...
 
 
 class IronRagClient:
@@ -72,12 +348,8 @@ class IronRagClient:
     ) -> None:
         self._settings = settings
         self._owns_client = client is None
-        configured_mutation_timeout = settings.ironrag_mutation_timeout_seconds
-        item_budget = max(1.0, settings.sync_item_timeout_seconds - 5.0)
-        self._mutation_timeout = configured_mutation_timeout or min(
-            settings.request_timeout_seconds,
-            item_budget,
-        )
+        self._default_poll_interval = settings.operation_poll_interval_seconds
+        self._default_poll_budget = settings.operation_poll_budget_seconds
         self._client = client or httpx.AsyncClient(
             base_url=settings.ironrag_base_url.rstrip("/"),
             timeout=settings.request_timeout_seconds,
@@ -96,6 +368,8 @@ class IronRagClient:
 
     async def __aexit__(self, *_: object) -> None:
         await self.aclose()
+
+    # -- catalog -----------------------------------------------------------
 
     async def resolve_library_refs(
         self,
@@ -173,7 +447,7 @@ class IronRagClient:
         response = await self._client.get(path)
         if response.status_code >= 400:
             raise IronRagCatalogError(
-                f"IronRAG catalog {resource} → {response.status_code}: {response.text[:400]}"
+                f"IronRAG catalog {resource} -> {response.status_code}: {response.text[:400]}"
             )
         try:
             payload = response.json()
@@ -185,353 +459,350 @@ class IronRagClient:
             )
         return payload
 
-    async def find_document_by_external_key(
-        self, library_id: UUID, external_key: str
-    ) -> dict[str, Any] | None:
-        """Find a document by its exact external key.
+    # -- documents -----------------------------------------------------------
 
-        IronRAG's list endpoint has no exact ``externalKey`` filter, but it
-        does expose ``search`` (a case-insensitive ``ILIKE`` on
-        ``external_key`` backed by a pg_trgm index). We pass the external
-        key as ``search`` to narrow the server-side result to the handful
-        of substring matches in a single request, then compare
-        ``externalKey`` exactly client-side (``search`` is a substring
-        match, so ``confluence:page:42`` would also match
-        ``confluence:page:420``). If the backend rejects ``search`` we fall
-        back to a full cursor walk and match client-side.
+    async def find_document(self, library_id: UUID, external_key: str) -> DocumentResource | None:
+        """Resolve a document by its exact external key.
 
-        This replaces the previous full-library pagination (~one page per
-        200 docs, for *every* lookup) that dominated request volume against
-        large libraries.
+        There is no dedicated exact-match filter on the list endpoint --
+        only a ``search`` substring/ILIKE filter on ``external_key``
+        (plan S7.1 describes an exact filter as an aspiration; the landed
+        API does not implement one). This narrows server-side via
+        ``search=external_key`` and returns the first page item whose
+        ``external_key`` equals the requested key exactly, which is still
+        a single bounded request rather than the old substring-ILIKE +
+        client filter + full-scan-fallback dance.
         """
+        async for document in self.list_documents(
+            library_id, external_key=external_key, limit=50
+        ):
+            return document
+        return None
+
+    async def list_documents(
+        self,
+        library_id: UUID,
+        *,
+        search: str | None = None,
+        external_key: str | None = None,
+        status: Sequence[str] = (),
+        include_deleted: bool = False,
+        limit: int = 200,
+    ) -> AsyncIterator[DocumentResource]:
+        """Walk every page of the library's document collection.
+
+        The only read-collection interface (plan S7.1) -- cursor pagination
+        to ``nextCursor is None``, never a ``total``-driven offset fallback.
+
+        ``external_key`` is not a server-side parameter (see
+        :meth:`find_document`): when set, it is sent as ``search`` to
+        narrow server-side, and every yielded item is additionally
+        filtered to an exact ``external_key`` match client-side, so this
+        behaves as an exact-key list (normally 0 or 1 result) rather than
+        a substring search. Passing both ``search`` and ``external_key``
+        is not supported -- they would need conflicting narrowing.
+        """
+        if search and external_key:
+            raise ValueError("list_documents accepts either search or external_key, not both")
+        server_search = external_key or search
         cursor: str | None = None
-        page_size = 200
-        use_search = True
         while True:
-            params: dict[str, Any] = {
-                "libraryId": str(library_id),
-                "limit": page_size,
-            }
-            if use_search:
-                params["search"] = external_key
+            params: dict[str, Any] = {"limit": limit}
+            if server_search:
+                params["search"] = server_search
+            if status:
+                params["status"] = ",".join(status)
+            if include_deleted:
+                params["includeDeleted"] = "true"
             if cursor:
                 params["cursor"] = cursor
 
-            response = await self._client.get("/v1/content/documents", params=params)
-            if response.status_code in (400, 422) and use_search and cursor is None:
-                # Backend does not understand the search filter — retry the
-                # whole lookup as a plain paginated scan.
-                use_search = False
-                continue
+            response = await self._client.get(
+                f"/v1/content/libraries/{library_id}/documents", params=params
+            )
             if response.status_code == 404:
-                return None
+                return
             if response.status_code >= 400:
-                raise IronRagError(
-                    f"IronRAG list documents → {response.status_code}: {response.text[:400]}"
-                )
+                _raise_for_problem(response)
+            page = DocumentPage.model_validate(response.json())
+            for item in page.items:
+                if external_key and item.external_key != external_key:
+                    continue
+                yield item
+            if not page.next_cursor:
+                return
+            cursor = page.next_cursor
 
-            payload = response.json()
-            items: list[dict[str, Any]] = payload.get("items", payload.get("documents", []))
-            for item in items:
-                if item.get("externalKey") == external_key:
-                    return item
-
-            cursor = payload.get("nextCursor") or payload.get("next_cursor")
-            if not cursor or not items:
-                return None
-
-    async def upload_document(
+    async def walk_all_documents(
         self,
-        *,
         library_id: UUID,
+        *,
+        concurrency: int = DEFAULT_REWALK_CONCURRENCY,
+        resume_from_checkpoint: bool = True,
+        checkpoint_store: WalkCheckpointStore | None = None,
+    ) -> AsyncIterator[DocumentResource]:
+        """Checkpointed full walk of every document in ``library_id``.
+
+        List pagination is inherently sequential (page N+1 needs page N's
+        cursor), so ``concurrency`` does not parallelize the walk itself --
+        it is the fan-out bound the caller should apply when it issues
+        create/revision calls in response to each yielded item (the same
+        semaphore pattern :class:`~ironrag_connector.sync.SyncManager`
+        already uses for a sweep). ``checkpoint_store`` persists the
+        in-flight cursor after every page so an interrupted or
+        rate-limited re-walk resumes instead of restarting (plan S7.6).
+        """
+        if concurrency < 1:
+            raise ValueError("concurrency must be >= 1")
+        cursor = (
+            checkpoint_store.load_cursor()
+            if resume_from_checkpoint and checkpoint_store is not None
+            else None
+        )
+        limit = 200
+        while True:
+            params: dict[str, Any] = {"limit": limit}
+            if cursor:
+                params["cursor"] = cursor
+            response = await self._client.get(
+                f"/v1/content/libraries/{library_id}/documents", params=params
+            )
+            if response.status_code == 404:
+                return
+            if response.status_code >= 400:
+                _raise_for_problem(response)
+            page = DocumentPage.model_validate(response.json())
+            for item in page.items:
+                yield item
+            cursor = page.next_cursor
+            if checkpoint_store is not None:
+                checkpoint_store.save_cursor(cursor)
+            if not cursor:
+                return
+
+    async def get_document(self, document_id: UUID | str) -> DocumentResource | None:
+        response = await self._client.get(f"/v1/content/documents/{document_id}")
+        if response.status_code == 404:
+            return None
+        if response.status_code >= 400:
+            _raise_for_problem(response)
+        payload = response.json()
+        return DocumentResource.model_validate(_extract_document_payload(payload))
+
+    async def create_document(
+        self,
+        library_id: UUID,
+        *,
         external_key: str,
-        file_bytes: bytes,
-        file_name: str,
-        mime_type: str,
-        title: str | None,
-        idempotency_key: str,
+        file_bytes: bytes | None = None,
+        file_name: str | None = None,
+        mime_type: str | None = None,
+        title: str | None = None,
         document_hint: str | None = None,
         parent_external_key: str | None = None,
-    ) -> dict[str, Any]:
-        files = {"file": (file_name, file_bytes, mime_type)}
-        data: dict[str, Any] = {
-            "library_id": str(library_id),
-            "external_key": external_key,
-            "idempotency_key": idempotency_key,
-        }
-        if title:
-            data["title"] = title
-        if document_hint is not None:
-            data["document_hint"] = document_hint
-        if parent_external_key is not None:
-            # Declares the source-side parent so IronRAG marks this document
-            # as attached context of (or an attachment to) that parent. The
-            # backend derives document_role from the declared parent + this
-            # revision's media class; the connector sends no role itself.
-            data["parent_external_key"] = parent_external_key
-        log.info(
-            "ironrag.mutation.start",
-            operation="upload",
-            external_key=external_key,
-            timeout_seconds=self._mutation_timeout,
-        )
-        try:
+    ) -> DocumentResource:
+        """Create a document. Content-negotiated: passing ``file_bytes``
+        sends a multipart upload; omitting it sends a JSON metadata-only
+        create. One creation door, one HTTP path (plan S7.1/S7.2).
+
+        No ``idempotency_key`` parameter: create dedup is the server's
+        exact ``externalKey`` uniqueness check plus the typed
+        :class:`IronRagDuplicateContentError` 409, not an idempotency key
+        (plan S7.1) -- content-hash idempotency keys apply to revisions and
+        deletes only.
+
+        Raises :class:`IronRagDuplicateContentError` on a 409 conflict;
+        the error carries ``existing_document_id`` for the caller to adopt.
+        """
+        log.info("ironrag.create_document.start", external_key=external_key)
+        if file_bytes is not None:
+            if not file_name or not mime_type:
+                raise ValueError("file_name and mime_type are required when file_bytes is set")
+            files = {"file": (file_name, file_bytes, mime_type)}
+            # `library_id` is required by the server's multipart parser even
+            # though this endpoint is already scoped by the path segment --
+            # the parser (shared plumbing) rejects a multipart body with no
+            # `library_id` field with 400 "missing library_id" before the
+            # handler gets a chance to ignore the value in favor of the path
+            # parameter. Send it anyway; the server discards it.
+            data: dict[str, Any] = {
+                "library_id": str(library_id),
+                "external_key": external_key,
+            }
+            if title:
+                data["title"] = title
+            if document_hint is not None:
+                data["document_hint"] = document_hint
+            if parent_external_key is not None:
+                data["parent_external_key"] = parent_external_key
             response = await self._client.post(
-                "/v1/content/documents/upload",
+                f"/v1/content/libraries/{library_id}/documents",
                 data=data,
                 files=files,
-                timeout=self._mutation_timeout,
             )
-        except httpx.TimeoutException as exc:
-            log.warning(
-                "ironrag.mutation.timeout",
-                operation="upload",
-                external_key=external_key,
-                timeout_seconds=self._mutation_timeout,
-            )
-            raise IronRagMutationTimeoutError(
-                f"IronRAG upload admission timed out after {self._mutation_timeout:.1f}s"
-            ) from exc
-
-        if response.status_code == 409:
-            try:
-                body = response.json()
-            except Exception:
-                body = {}
-            error_kind = body.get("errorKind", "")
-            error_msg = body.get("error", "") or body.get("message", "") or ""
-            if error_kind == "conflict" and "duplicate content" in error_msg.lower():
-                match = _EXISTING_DOC_RE.search(error_msg)
-                existing_id: str | None = match.group(1) if match else None
-                log.debug(
-                    "ironrag.upload.duplicate_content",
-                    external_key=external_key,
-                    existing_id=existing_id,
-                )
-                return {
-                    "document": {"id": existing_id},
-                    "duplicate_of_existing": True,
-                }
-
-        if response.status_code >= 400:
-            raise IronRagError(f"IronRAG upload → {response.status_code}: {response.text[:400]}")
-        payload = _json_object(response)
-        log.info(
-            "ironrag.mutation.accepted",
-            operation="upload",
-            external_key=external_key,
-            status_code=response.status_code,
-        )
-        return payload
-
-    async def replace_document(
-        self,
-        *,
-        document_id: UUID | str,
-        file_bytes: bytes,
-        file_name: str,
-        mime_type: str,
-        idempotency_key: str,
-        document_hint: str | None = None,
-    ) -> dict[str, Any] | None:
-        """Replace document bytes. Returns ``None`` if IronRAG reports
-        the document no longer exists (404/410) — caller must invalidate
-        its cursor and retry as upload."""
-        files = {"file": (file_name, file_bytes, mime_type)}
-        data = {"idempotency_key": idempotency_key}
-        if document_hint is not None:
-            data["document_hint"] = document_hint
-        log.info(
-            "ironrag.mutation.start",
-            operation="replace",
-            document_id=str(document_id),
-            timeout_seconds=self._mutation_timeout,
-        )
-        try:
+        else:
+            json_body: dict[str, Any] = {"externalKey": external_key}
+            if title:
+                json_body["title"] = title
+            if document_hint is not None:
+                json_body["documentHint"] = document_hint
+            if parent_external_key is not None:
+                json_body["parentExternalKey"] = parent_external_key
             response = await self._client.post(
-                f"/v1/content/documents/{document_id}/replace",
-                data=data,
-                files=files,
-                timeout=self._mutation_timeout,
+                f"/v1/content/libraries/{library_id}/documents",
+                json=json_body,
             )
-        except httpx.TimeoutException as exc:
-            log.warning(
-                "ironrag.mutation.timeout",
-                operation="replace",
-                document_id=str(document_id),
-                timeout_seconds=self._mutation_timeout,
-            )
-            raise IronRagMutationTimeoutError(
-                f"IronRAG replace admission timed out after {self._mutation_timeout:.1f}s"
-            ) from exc
-        if response.status_code in (404, 410):
-            return None
-        if response.status_code >= 400:
-            raise IronRagError(f"IronRAG replace → {response.status_code}: {response.text[:400]}")
-        payload = _json_object(response)
-        log.info(
-            "ironrag.mutation.accepted",
-            operation="replace",
-            document_id=str(document_id),
-            status_code=response.status_code,
-        )
-        return payload
 
-    async def get_document(self, document_id: UUID | str) -> dict[str, Any] | None:
-        response = await self._client.get(f"/v1/content/documents/{document_id}")
-        if response.status_code in (404, 410):
-            return None
         if response.status_code >= 400:
-            raise IronRagError(
-                f"IronRAG get document → {response.status_code}: {response.text[:400]}"
-            )
-        payload = _json_object(response)
-        document = payload.get("document") or payload
-        if not isinstance(document, dict):
-            raise IronRagError("IronRAG document response was not a JSON object")
+            _raise_for_problem(response)
+        payload = response.json()
+        document = DocumentResource.model_validate(_extract_document_payload(payload))
+        log.info(
+            "ironrag.create_document.created",
+            external_key=external_key,
+            document_id=str(document.id),
+        )
         return document
 
-    async def list_documents_by_external_key_prefix(
+    async def create_revision(
         self,
-        library_id: UUID,
-        prefix: str,
+        document_id: UUID | str,
         *,
-        page_size: int = 200,
-    ) -> list[tuple[str, str]]:
-        results: list[tuple[str, str]] = []
-        cursor: str | None = None
-        offset = 0
-        use_offset = False
-        server_filter_supported: bool | None = None
-
-        while True:
-            params: dict[str, str | int] = {
-                "libraryId": str(library_id),
-                "limit": page_size,
-            }
-            if cursor:
-                params["cursor"] = cursor
-            elif use_offset or offset:
-                params["offset"] = offset
-            if server_filter_supported is not False:
-                params["externalKeyPrefix"] = prefix
-
-            response = await self._client.get("/v1/content/documents", params=params)
-
-            if response.status_code in (400, 422) and server_filter_supported is None:
-                server_filter_supported = False
-                cursor = None
-                offset = 0
-                use_offset = False
-                continue
-
-            if server_filter_supported is not False:
-                server_filter_supported = True
-
-            if response.status_code == 404:
-                break
-            if response.status_code >= 400:
-                raise IronRagError(
-                    f"IronRAG list documents → {response.status_code}: {response.text[:400]}"
-                )
-
-            payload = response.json()
-            items: list[dict[str, Any]] = payload.get(
-                "documents", payload.get("data", payload.get("items", []))
-            )
-            for item in items:
-                key = item.get("externalKey") or ""
-                doc_id = item.get("id")
-                if key.startswith(prefix) and doc_id:
-                    results.append((key, str(doc_id)))
-
-            next_cursor = payload.get("nextCursor") or payload.get("next_cursor")
-            if next_cursor:
-                cursor = str(next_cursor)
-                use_offset = False
-                continue
-
-            total = _optional_int(payload.get("total"))
-            if total is not None:
-                offset += len(items)
-                if not items or offset >= total:
-                    break
-                cursor = None
-                use_offset = True
-                continue
-
-            if not items:
-                break
-            break
-
-        return results
-
-    async def delete_document(self, document_id: UUID | str, idempotency_key: str) -> None:
+        mode: Literal["append", "replace"],
+        markdown: str | None = None,
+        appended_text: str | None = None,
+        file_bytes: bytes | None = None,
+        file_name: str | None = None,
+        mime_type: str | None = None,
+        idempotency_key: str,
+    ) -> OperationHandle:
+        """Create a new revision. Content-negotiated, mirroring
+        :meth:`create_document`: ``file_bytes`` sends a multipart file
+        replace; otherwise a JSON ``{mode, appendedText|markdown}`` body.
+        Always asynchronous -- returns an :class:`OperationHandle` to poll
+        via :meth:`wait_for_operation`.
+        """
         log.info(
-            "ironrag.mutation.start",
-            operation="delete",
+            "ironrag.create_revision.start",
             document_id=str(document_id),
-            timeout_seconds=self._mutation_timeout,
+            mode=mode,
         )
-        try:
-            response = await self._client.request(
-                "DELETE",
-                f"/v1/content/documents/{document_id}",
-                headers={"Idempotency-Key": idempotency_key},
-                timeout=self._mutation_timeout,
+        if file_bytes is not None:
+            if not file_name or not mime_type:
+                raise ValueError("file_name and mime_type are required when file_bytes is set")
+            files = {"file": (file_name, file_bytes, mime_type)}
+            data = {"idempotency_key": idempotency_key}
+            response = await self._client.post(
+                f"/v1/content/documents/{document_id}/revisions",
+                data=data,
+                files=files,
             )
-        except httpx.TimeoutException as exc:
-            log.warning(
-                "ironrag.mutation.timeout",
-                operation="delete",
-                document_id=str(document_id),
-                timeout_seconds=self._mutation_timeout,
+        else:
+            json_body: dict[str, Any] = {"mode": mode, "idempotencyKey": idempotency_key}
+            if mode == "append":
+                if appended_text is None:
+                    raise ValueError("appended_text is required when mode='append'")
+                json_body["appendedText"] = appended_text
+            else:
+                if markdown is None:
+                    raise ValueError("markdown is required when mode='replace' without file_bytes")
+                json_body["markdown"] = markdown
+            response = await self._client.post(
+                f"/v1/content/documents/{document_id}/revisions",
+                json=json_body,
             )
-            raise IronRagMutationTimeoutError(
-                f"IronRAG delete admission timed out after {self._mutation_timeout:.1f}s"
-            ) from exc
-        if response.status_code in (200, 202, 204, 404):
-            log.info(
-                "ironrag.mutation.accepted",
-                operation="delete",
-                document_id=str(document_id),
-                status_code=response.status_code,
-            )
-            return
-        raise IronRagError(f"IronRAG delete → {response.status_code}: {response.text[:400]}")
 
+        if response.status_code >= 400:
+            _raise_for_problem(response)
+        body = response.json() if response.content else {}
+        operation_id = _operation_id_from_response(body)
+        log.info(
+            "ironrag.create_revision.accepted",
+            document_id=str(document_id),
+            operation_id=str(operation_id),
+        )
+        return OperationHandle(operation_id=operation_id)
 
-def _optional_int(value: object) -> int | None:
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str):
-        try:
-            return int(value)
-        except ValueError:
+    async def delete_document(
+        self, document_id: UUID | str, *, idempotency_key: str
+    ) -> OperationHandle | None:
+        """Delete a document. Returns ``None`` when IronRAG already has no
+        such document (idempotent no-op); otherwise an
+        :class:`OperationHandle` to poll to terminal.
+
+        Deletes are asynchronous like revisions in effect (an
+        ``ops_async_operation`` row is always created and must be polled to
+        terminal), but NOT in HTTP shape: the handler returns a plain 200
+        with the operation id only in the JSON body, not 202 + Location like
+        create-revision. Both are handled uniformly via the typed body field
+        (see :func:`_operation_id_from_response`), so this difference is
+        invisible to callers of this method.
+        """
+        log.info("ironrag.delete_document.start", document_id=str(document_id))
+        response = await self._client.request(
+            "DELETE",
+            f"/v1/content/documents/{document_id}",
+            headers={"Idempotency-Key": idempotency_key},
+        )
+        if response.status_code == 404:
             return None
-    return None
+        if response.status_code >= 400:
+            _raise_for_problem(response)
+        body = response.json() if response.content else {}
+        operation_id = _operation_id_from_response(body)
+        log.info(
+            "ironrag.delete_document.accepted",
+            document_id=str(document_id),
+            operation_id=str(operation_id),
+        )
+        return OperationHandle(operation_id=operation_id)
 
+    # -- async operations -----------------------------------------------------
 
-def _json_object(response: httpx.Response) -> dict[str, Any]:
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise IronRagError("IronRAG response was not a JSON object")
-    return payload
+    async def get_operation(self, operation_id: UUID | str) -> OperationStatus:
+        response = await self._client.get(f"/v1/ops/operations/{operation_id}")
+        if response.status_code >= 400:
+            _raise_for_problem(response)
+        return OperationStatus.model_validate(response.json())
 
+    async def wait_for_operation(
+        self,
+        operation_id: UUID | str,
+        *,
+        poll_interval: float | None = None,
+        budget: float | None = None,
+    ) -> OperationStatus:
+        """Poll ``GET /v1/ops/operations/{operationId}`` to a terminal state.
 
-def document_library_id(document: Mapping[str, Any]) -> str | None:
-    for key in ("libraryId", "library_id", "libraryID"):
-        value = document.get(key)
-        if value:
-            return str(value)
-    library = document.get("library")
-    if isinstance(library, Mapping):
-        value = library.get("id")
-        if value:
-            return str(value)
-    return None
+        The one poll-to-terminal primitive every mutating call funnels
+        through (plan S7.2/S7.3). Terminal states:
+
+        * ``ready`` -- returned normally.
+        * ``superseded`` / ``canceled`` -- returned normally; the caller
+          decides how to react (a later write won, or the operation was
+          explicitly canceled -- neither is a client-side failure).
+        * ``failed`` -- raises :class:`IronRagOperationFailedError`.
+
+        Raises :class:`IronRagMutationTimeoutError` if no terminal state is
+        reached inside ``budget`` seconds.
+        """
+        resolved_interval = (
+            poll_interval if poll_interval is not None else self._default_poll_interval
+        )
+        resolved_budget = budget if budget is not None else self._default_poll_budget
+        deadline = time.monotonic() + resolved_budget
+        while True:
+            status = await self.get_operation(operation_id)
+            if status.status.is_terminal:
+                if status.status is OperationStatusValue.FAILED:
+                    raise IronRagOperationFailedError(status)
+                return status
+            if time.monotonic() >= deadline:
+                raise IronRagMutationTimeoutError(
+                    f"operation {operation_id} did not reach a terminal state "
+                    f"within {resolved_budget:.1f}s"
+                )
+            await asyncio.sleep(resolved_interval)
 
 
 def _index_catalog_rows(

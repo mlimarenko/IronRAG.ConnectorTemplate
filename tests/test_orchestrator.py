@@ -1,14 +1,27 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-import httpx
 import pytest
 from echo_connector.adapter import EchoAdapter, EchoPage
 
-from ironrag_connector.ironrag import IronRagError, IronRagMutationTimeoutError
+from ironrag_connector.ironrag import (
+    DocumentResource,
+    IronRagConflictError,
+    IronRagDuplicateContentError,
+    IronRagError,
+    IronRagMutationTimeoutError,
+    IronRagNotFoundError,
+    OperationHandle,
+    OperationProgress,
+    OperationStatus,
+    OperationStatusValue,
+    ProblemDetails,
+)
 from ironrag_connector.orchestrator import Orchestrator
 from ironrag_connector.policy import (
     DeleteAction,
@@ -30,111 +43,217 @@ from ironrag_connector.sync import SyncManager
 WS = UUID("00000000-0000-0000-0000-000000000099")
 LIB = UUID("00000000-0000-0000-0000-000000000000")
 LIB2 = UUID("00000000-0000-0000-0000-000000000002")
-LIB3 = UUID("00000000-0000-0000-0000-000000000003")
+
+
+def _doc_id(n: int) -> UUID:
+    """Deterministic synthetic document/operation id for test fixtures."""
+    return UUID(int=n)
+
+
+DOC_PRE = _doc_id(1)
+DOC_OLD = _doc_id(2)
+DOC_IMAGE_PRE = _doc_id(3)
+
+
+def _document(doc_id: UUID, library_id: UUID, external_key: str) -> DocumentResource:
+    return DocumentResource(
+        id=doc_id, library_id=library_id, external_key=external_key, status="ready"
+    )
+
+
+def _duplicate_content_error(existing_id: UUID) -> IronRagDuplicateContentError:
+    problem = ProblemDetails(
+        type="urn:ironrag:error:duplicate_content",
+        title="Duplicate Content",
+        status=409,
+        detail="synthetic duplicate content",
+        code="duplicate_content",
+        existing_document_id=existing_id,
+    )
+    return IronRagDuplicateContentError(problem)
+
+
+def _conflict_error() -> IronRagConflictError:
+    problem = ProblemDetails(
+        type="urn:ironrag:error:conflicting_mutation",
+        title="Conflicting Mutation",
+        status=409,
+        detail="synthetic conflicting mutation",
+        code="conflicting_mutation",
+    )
+    return IronRagConflictError(problem)
+
+
+def _not_found_error() -> IronRagNotFoundError:
+    problem = ProblemDetails(
+        type="urn:ironrag:error:not_found",
+        title="Not Found",
+        status=404,
+        detail="synthetic not found",
+        code="not_found",
+    )
+    return IronRagNotFoundError(problem)
+
+
+def _ready_operation(op_id: UUID) -> OperationStatus:
+    return OperationStatus(
+        id=op_id,
+        workspace_id=WS,
+        library_id=LIB,
+        operation_kind="revise_document",
+        status=OperationStatusValue.READY,
+        created_at=datetime.now(tz=UTC),
+        progress=OperationProgress(),
+    )
 
 
 class FakeIronRag:
+    """In-memory double for :class:`IronRagClient` matching its redesigned
+    interface: synchronous ``create_document``, async ``create_revision``/
+    ``delete_document`` (submit -> poll via ``wait_for_operation``), and
+    ``find_document``/``get_document``/``list_documents`` reads."""
+
     def __init__(self) -> None:
-        self.documents: dict[tuple[UUID, str], dict[str, Any]] = {}
-        self.uploads: list[dict[str, Any]] = []
-        self.replaces: list[dict[str, Any]] = []
+        self.documents: dict[tuple[UUID, str], DocumentResource] = {}
+        self.creates: list[dict[str, Any]] = []
+        self.revisions: list[dict[str, Any]] = []
         self.deletes: list[str] = []
         self.duplicate_for_key: str | None = None
-        self.replace_conflicts: set[str] = set()
-        self.next_doc_id = 100
+        self.revision_conflicts: set[str] = set()
         self.find_calls = 0
+        self._next_doc_id = 100
+        self._next_op_id = 1000
+        self._duplicate_existing_id: UUID | None = None
+        self._operations: dict[UUID, OperationStatus] = {}
 
-    async def find_document_by_external_key(
-        self, library_id: UUID, external_key: str
-    ) -> dict[str, Any] | None:
+    def _new_doc_id(self) -> UUID:
+        doc_id = _doc_id(self._next_doc_id)
+        self._next_doc_id += 1
+        return doc_id
+
+    def _new_op_id(self) -> UUID:
+        op_id = _doc_id(self._next_op_id)
+        self._next_op_id += 1
+        return op_id
+
+    async def find_document(self, library_id: UUID, external_key: str) -> DocumentResource | None:
         self.find_calls += 1
         return self.documents.get((library_id, external_key))
 
-    async def get_document(self, document_id: str) -> dict[str, Any] | None:
-        for (library_id, _key), doc in self.documents.items():
-            if doc["id"] == document_id:
-                return {**doc, "libraryId": str(library_id)}
+    async def get_document(self, document_id: UUID | str) -> DocumentResource | None:
+        for doc in self.documents.values():
+            if str(doc.id) == str(document_id):
+                return doc
         return None
 
-    async def upload_document(
+    async def create_document(
         self,
-        *,
         library_id: UUID,
+        *,
         external_key: str,
-        file_bytes: bytes,
-        file_name: str,
-        mime_type: str,
-        title: str | None,
-        idempotency_key: str,
+        file_bytes: bytes | None = None,
+        file_name: str | None = None,
+        mime_type: str | None = None,
+        title: str | None = None,
         document_hint: str | None = None,
         parent_external_key: str | None = None,
-    ) -> dict[str, Any]:
-        self.uploads.append(
+    ) -> DocumentResource:
+        self.creates.append(
             {
                 "library_id": library_id,
                 "external_key": external_key,
-                "size": len(file_bytes),
-                "idempotency_key": idempotency_key,
+                "size": len(file_bytes) if file_bytes is not None else 0,
                 "mime_type": mime_type,
                 "document_hint": document_hint,
                 "parent_external_key": parent_external_key,
             }
         )
         if self.duplicate_for_key == external_key:
-            return {
-                "document": {"id": "existing-uuid"},
-                "duplicate_of_existing": True,
-            }
-        doc_id = f"doc-{self.next_doc_id}"
-        self.next_doc_id += 1
-        doc = {
-            "id": doc_id,
-            "externalKey": external_key,
-            "title": title,
-        }
+            if self._duplicate_existing_id is None:
+                self._duplicate_existing_id = self._new_doc_id()
+            raise _duplicate_content_error(self._duplicate_existing_id)
+        doc = DocumentResource(
+            id=self._new_doc_id(),
+            library_id=library_id,
+            external_key=external_key,
+            status="ready",
+            file_name=file_name,
+            document_hint=document_hint,
+        )
         self.documents[(library_id, external_key)] = doc
-        return {"document": doc}
+        return doc
 
-    async def replace_document(
+    async def create_revision(
         self,
+        document_id: UUID | str,
         *,
-        document_id: str,
-        file_bytes: bytes,
-        file_name: str,
-        mime_type: str,
+        mode: str,
+        markdown: str | None = None,
+        appended_text: str | None = None,
+        file_bytes: bytes | None = None,
+        file_name: str | None = None,
+        mime_type: str | None = None,
         idempotency_key: str,
-        document_hint: str | None = None,
-    ) -> dict[str, Any]:
-        if document_id in self.replace_conflicts:
-            raise IronRagError(
-                "IronRAG replace → 409: "
-                '{"error":"conflict: document is still processing a previous mutation",'
-                '"errorKind":"conflicting_mutation"}'
-            )
-        self.replaces.append(
+    ) -> OperationHandle:
+        doc_id_str = str(document_id)
+        if doc_id_str in self.revision_conflicts:
+            raise _conflict_error()
+        if not any(str(doc.id) == doc_id_str for doc in self.documents.values()):
+            raise _not_found_error()
+        size = len(file_bytes) if file_bytes is not None else len(appended_text or markdown or "")
+        self.revisions.append(
             {
-                "document_id": document_id,
-                "size": len(file_bytes),
+                "document_id": doc_id_str,
+                "mode": mode,
+                "size": size,
                 "idempotency_key": idempotency_key,
-                "document_hint": document_hint,
             }
         )
-        return {"document": {"id": document_id}}
+        op_id = self._new_op_id()
+        self._operations[op_id] = _ready_operation(op_id)
+        return OperationHandle(operation_id=op_id)
 
-    async def delete_document(self, document_id: str, idempotency_key: str) -> None:
-        self.deletes.append(document_id)
+    async def delete_document(
+        self, document_id: UUID | str, *, idempotency_key: str
+    ) -> OperationHandle | None:
+        found_key = None
+        for key, doc in self.documents.items():
+            if str(doc.id) == str(document_id):
+                found_key = key
+                break
+        if found_key is None:
+            return None
+        del self.documents[found_key]
+        self.deletes.append(str(document_id))
+        op_id = self._new_op_id()
+        self._operations[op_id] = _ready_operation(op_id)
+        return OperationHandle(operation_id=op_id)
+
+    async def wait_for_operation(
+        self,
+        operation_id: UUID | str,
+        *,
+        poll_interval: float | None = None,
+        budget: float | None = None,
+    ) -> OperationStatus:
+        return self._operations[UUID(str(operation_id))]
+
+    async def list_documents(
+        self,
+        library_id: UUID,
+        *,
+        search: str | None = None,
+        external_key: str | None = None,
+        status: Any = (),
+        include_deleted: bool = False,
+        limit: int = 200,
+    ) -> AsyncIterator[DocumentResource]:
         for (lib, key), doc in list(self.documents.items()):
-            if doc["id"] == document_id:
-                self.documents.pop((lib, key))
-
-    async def list_documents_by_external_key_prefix(
-        self, library_id: UUID, prefix: str, *, page_size: int = 200
-    ) -> list[tuple[str, str]]:
-        return [
-            (key, doc["id"])
-            for (lib, key), doc in self.documents.items()
-            if lib == library_id and key.startswith(prefix)
-        ]
+            if lib != library_id:
+                continue
+            if external_key and key != external_key:
+                continue
+            yield doc
 
 
 def _library_ref(library_id: UUID) -> str:
@@ -183,12 +302,15 @@ async def test_create_new_item(tmp_path: Path) -> None:
     ref = await _first(adapter.iter_items())
     out = await orchestrator.push_ref(ref)
     assert out.action == "created"
-    assert out.ironrag_document_id == "doc-100"
-    assert state.get("page", "1").change_token == "t1"
+    created_doc = ironrag.documents[(LIB, "echo:page:1")]
+    assert out.ironrag_document_id == str(created_doc.id)
+    row = state.get("page", "1")
+    assert row is not None
+    assert row.change_token == "t1"
 
 
 @pytest.mark.asyncio
-async def test_document_hint_forwards_on_upload(tmp_path: Path) -> None:
+async def test_document_hint_forwards_on_create(tmp_path: Path) -> None:
     adapter = EchoAdapter({})
     state = _state(tmp_path)
     ironrag = FakeIronRag()
@@ -217,44 +339,7 @@ async def test_document_hint_forwards_on_upload(tmp_path: Path) -> None:
     out = await orchestrator.push_item(item, route, PushPolicy())
 
     assert out.action == "created"
-    assert ironrag.uploads[0]["document_hint"] == "https://docs.example/hinted"
-
-
-@pytest.mark.asyncio
-async def test_document_hint_forwards_on_replace(tmp_path: Path) -> None:
-    adapter = EchoAdapter({})
-    state = _state(tmp_path)
-    ironrag = FakeIronRag()
-    ironrag.documents[(LIB, "echo:page:hinted")] = {
-        "id": "doc-pre",
-        "externalKey": "echo:page:hinted",
-    }
-    orchestrator = Orchestrator(
-        adapter=adapter,
-        ironrag=ironrag,  # type: ignore[arg-type]
-        router=_router(),
-        state=state,
-        policies=_policies(),
-    )
-    item = SourceItem(
-        ref=SourceItemRef(
-            item_id="hinted",
-            kind="page",
-            external_key="echo:page:hinted",
-            change_token="t2",
-        ),
-        payload=b"hello again",
-        mime_type="text/markdown",
-        file_name="hinted.md",
-        title="Hinted",
-        document_hint="Canonical page label",
-    )
-    route = _router().resolve(item.ref)
-
-    out = await orchestrator.push_item(item, route, PushPolicy())
-
-    assert out.action == "replaced"
-    assert ironrag.replaces[0]["document_hint"] == "Canonical page label"
+    assert ironrag.creates[0]["document_hint"] == "https://docs.example/hinted"
 
 
 @pytest.mark.asyncio
@@ -262,16 +347,13 @@ async def test_unchanged_short_circuits_to_noop(tmp_path: Path) -> None:
     adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t1")})
     state = _state(tmp_path)
     ironrag = FakeIronRag()
-    ironrag.documents[(LIB, "echo:page:1")] = {
-        "id": "doc-pre",
-        "externalKey": "echo:page:1",
-    }
+    ironrag.documents[(LIB, "echo:page:1")] = _document(DOC_PRE, LIB, "echo:page:1")
     state.upsert(
         kind="page",
         item_id="1",
         change_token="t1",
         external_key="echo:page:1",
-        ironrag_document_id="doc-pre",
+        ironrag_document_id=str(DOC_PRE),
         ironrag_library_id=str(LIB),
     )
     orchestrator = Orchestrator(
@@ -284,8 +366,8 @@ async def test_unchanged_short_circuits_to_noop(tmp_path: Path) -> None:
     ref = await _first(adapter.iter_items())
     out = await orchestrator.push_ref(ref)
     assert out.action == "noop_unchanged"
-    assert ironrag.uploads == []
-    assert ironrag.replaces == []
+    assert ironrag.creates == []
+    assert ironrag.revisions == []
 
 
 @pytest.mark.asyncio
@@ -293,16 +375,13 @@ async def test_changed_item_replaces(tmp_path: Path) -> None:
     adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hello2", updated_at="t2")})
     state = _state(tmp_path)
     ironrag = FakeIronRag()
-    ironrag.documents[(LIB, "echo:page:1")] = {
-        "id": "doc-pre",
-        "externalKey": "echo:page:1",
-    }
+    ironrag.documents[(LIB, "echo:page:1")] = _document(DOC_PRE, LIB, "echo:page:1")
     state.upsert(
         kind="page",
         item_id="1",
         change_token="t1",
         external_key="echo:page:1",
-        ironrag_document_id="doc-pre",
+        ironrag_document_id=str(DOC_PRE),
         ironrag_library_id=str(LIB),
     )
     orchestrator = Orchestrator(
@@ -315,8 +394,10 @@ async def test_changed_item_replaces(tmp_path: Path) -> None:
     ref = await _first(adapter.iter_items())
     out = await orchestrator.push_ref(ref)
     assert out.action == "replaced"
-    assert ironrag.replaces and ironrag.replaces[0]["document_id"] == "doc-pre"
-    assert state.get("page", "1").change_token == "t2"
+    assert ironrag.revisions and ironrag.revisions[0]["document_id"] == str(DOC_PRE)
+    row = state.get("page", "1")
+    assert row is not None
+    assert row.change_token == "t2"
 
 
 @pytest.mark.asyncio
@@ -326,17 +407,14 @@ async def test_conflicting_replace_is_deferred_without_advancing_cursor(
     adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hello2", updated_at="t2")})
     state = _state(tmp_path)
     ironrag = FakeIronRag()
-    ironrag.documents[(LIB, "echo:page:1")] = {
-        "id": "doc-pre",
-        "externalKey": "echo:page:1",
-    }
-    ironrag.replace_conflicts.add("doc-pre")
+    ironrag.documents[(LIB, "echo:page:1")] = _document(DOC_PRE, LIB, "echo:page:1")
+    ironrag.revision_conflicts.add(str(DOC_PRE))
     state.upsert(
         kind="page",
         item_id="1",
         change_token="t1",
         external_key="echo:page:1",
-        ironrag_document_id="doc-pre",
+        ironrag_document_id=str(DOC_PRE),
         ironrag_library_id=str(LIB),
     )
     orchestrator = Orchestrator(
@@ -351,54 +429,13 @@ async def test_conflicting_replace_is_deferred_without_advancing_cursor(
     out = await orchestrator.push_ref(ref)
 
     assert out.action == "skipped_changed"
-    assert out.ironrag_document_id == "doc-pre"
-    assert ironrag.uploads == []
-    assert ironrag.replaces == []
+    assert out.ironrag_document_id == str(DOC_PRE)
+    assert out.deferred is True
+    assert ironrag.creates == []
+    assert ironrag.revisions == []
     row = state.get("page", "1")
     assert row is not None
     assert row.change_token == "t1"
-
-
-@pytest.mark.asyncio
-async def test_legacy_cursor_same_route_conflict_preserves_old_token(
-    tmp_path: Path,
-) -> None:
-    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hello2", updated_at="t2")})
-    state = _state(tmp_path)
-    ironrag = FakeIronRag()
-    ironrag.documents[(LIB, "echo:page:1")] = {
-        "id": "doc-pre",
-        "externalKey": "echo:page:1",
-    }
-    ironrag.replace_conflicts.add("doc-pre")
-    state.upsert(
-        kind="page",
-        item_id="1",
-        change_token="t1",
-        external_key="echo:page:1",
-        ironrag_document_id="doc-pre",
-        ironrag_library_id=None,
-    )
-    orchestrator = Orchestrator(
-        adapter=adapter,
-        ironrag=ironrag,  # type: ignore[arg-type]
-        router=_router(),
-        state=state,
-        policies=_policies(),
-    )
-
-    ref = await _first(adapter.iter_items())
-    out = await orchestrator.push_ref(ref)
-
-    assert out.action == "skipped_changed"
-    assert out.ironrag_document_id == "doc-pre"
-    assert ironrag.uploads == []
-    assert ironrag.replaces == []
-    row = state.get("page", "1")
-    assert row is not None
-    assert row.change_token == "t1"
-    assert row.ironrag_document_id == "doc-pre"
-    assert row.ironrag_library_id == str(LIB)
 
 
 @pytest.mark.asyncio
@@ -406,10 +443,7 @@ async def test_on_changed_skip_does_not_replace(tmp_path: Path) -> None:
     adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t2")})
     state = _state(tmp_path)
     ironrag = FakeIronRag()
-    ironrag.documents[(LIB, "echo:page:1")] = {
-        "id": "doc-pre",
-        "externalKey": "echo:page:1",
-    }
+    ironrag.documents[(LIB, "echo:page:1")] = _document(DOC_PRE, LIB, "echo:page:1")
     policy = PushPolicy(on_changed=UpdateAction.SKIP)
     orchestrator = Orchestrator(
         adapter=adapter,
@@ -421,7 +455,7 @@ async def test_on_changed_skip_does_not_replace(tmp_path: Path) -> None:
     ref = await _first(adapter.iter_items())
     out = await orchestrator.push_ref(ref)
     assert out.action == "skipped_changed"
-    assert ironrag.replaces == []
+    assert ironrag.revisions == []
 
 
 @pytest.mark.asyncio
@@ -440,7 +474,7 @@ async def test_on_new_skip_does_not_create(tmp_path: Path) -> None:
     ref = await _first(adapter.iter_items())
     out = await orchestrator.push_ref(ref)
     assert out.action == "skipped_new"
-    assert ironrag.uploads == []
+    assert ironrag.creates == []
 
 
 @pytest.mark.asyncio
@@ -460,17 +494,37 @@ async def test_duplicate_content_skip(tmp_path: Path) -> None:
     ref = await _first(adapter.iter_items())
     out = await orchestrator.push_ref(ref)
     assert out.action == "skipped_duplicate_content"
-    assert out.ironrag_document_id == "existing-uuid"
+    assert ironrag._duplicate_existing_id is not None
+    assert out.ironrag_document_id == str(ironrag._duplicate_existing_id)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_content_fail_raises(tmp_path: Path) -> None:
+    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t1")})
+    state = _state(tmp_path)
+    ironrag = FakeIronRag()
+    ironrag.duplicate_for_key = "echo:page:1"
+    policy = PushPolicy(on_duplicate_content=DuplicateContentAction.FAIL)
+    orchestrator = Orchestrator(
+        adapter=adapter,
+        ironrag=ironrag,  # type: ignore[arg-type]
+        router=_router(),
+        state=state,
+        policies=_policies(policy),
+    )
+    ref = await _first(adapter.iter_items())
+    with pytest.raises(IronRagError, match="duplicate content"):
+        await orchestrator.push_ref(ref)
 
 
 @pytest.mark.asyncio
 async def test_cursor_wins_over_server_find(tmp_path: Path) -> None:
-    """Cursor with known document_id must short-circuit server lookup.
+    """Cursor with a known document_id must short-circuit the server lookup.
 
-    Simulates a deployment where IronRAG's list endpoint does not expose
-    externalKey: FakeIronRag.find_document_by_external_key returns None
-    always. Without the cursor-wins fix the orchestrator would re-upload
-    and trip a unique-violation server-side.
+    Simulates a deployment where a server-side find is unreliable:
+    ``BlindIronRag.find_document`` always returns None. Without the
+    cursor-wins fix the orchestrator would re-create and trip a
+    unique-violation server-side.
     """
     adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t2")})
     state = _state(tmp_path)
@@ -479,19 +533,18 @@ async def test_cursor_wins_over_server_find(tmp_path: Path) -> None:
         item_id="1",
         change_token="t1",
         external_key="echo:page:1",
-        ironrag_document_id="doc-pre",
+        ironrag_document_id=str(DOC_PRE),
         ironrag_library_id=str(LIB),
     )
 
     class BlindIronRag(FakeIronRag):
-        async def find_document_by_external_key(self, library_id, external_key):
-            return None  # IronRAG bug surrogate: list endpoint ignores filter
+        async def find_document(
+            self, library_id: UUID, external_key: str
+        ) -> DocumentResource | None:
+            return None  # server-side find surrogate: always misses
 
     ironrag = BlindIronRag()
-    ironrag.documents[(LIB, "echo:page:1")] = {
-        "id": "doc-pre",
-        "externalKey": "echo:page:1",
-    }
+    ironrag.documents[(LIB, "echo:page:1")] = _document(DOC_PRE, LIB, "echo:page:1")
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
@@ -502,8 +555,8 @@ async def test_cursor_wins_over_server_find(tmp_path: Path) -> None:
     ref = await _first(adapter.iter_items())
     out = await orchestrator.push_ref(ref)
     assert out.action == "replaced"
-    assert ironrag.uploads == [], "must not upload — cursor knew doc_id"
-    assert ironrag.replaces and ironrag.replaces[0]["document_id"] == "doc-pre"
+    assert ironrag.creates == [], "must not create -- cursor knew doc_id"
+    assert ironrag.revisions and ironrag.revisions[0]["document_id"] == str(DOC_PRE)
 
 
 @pytest.mark.asyncio
@@ -515,19 +568,22 @@ async def test_replace_timeout_is_deferred_without_advancing_cursor(tmp_path: Pa
         item_id="1",
         change_token="t1",
         external_key="echo:page:1",
-        ironrag_document_id="doc-pre",
+        ironrag_document_id=str(DOC_PRE),
         ironrag_library_id=str(LIB),
     )
 
     class TimeoutIronRag(FakeIronRag):
-        async def replace_document(self, **kwargs: Any) -> dict[str, Any]:
+        async def wait_for_operation(
+            self,
+            operation_id: UUID | str,
+            *,
+            poll_interval: float | None = None,
+            budget: float | None = None,
+        ) -> OperationStatus:
             raise IronRagMutationTimeoutError("synthetic mutation timeout")
 
     ironrag = TimeoutIronRag()
-    ironrag.documents[(LIB, "echo:page:1")] = {
-        "id": "doc-pre",
-        "externalKey": "echo:page:1",
-    }
+    ironrag.documents[(LIB, "echo:page:1")] = _document(DOC_PRE, LIB, "echo:page:1")
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
@@ -540,17 +596,18 @@ async def test_replace_timeout_is_deferred_without_advancing_cursor(tmp_path: Pa
     out = await orchestrator.push_ref(ref)
 
     assert out.action == "skipped_changed"
-    assert out.ironrag_document_id == "doc-pre"
+    assert out.ironrag_document_id == str(DOC_PRE)
     assert out.deferred is True
     row = state.get("page", "1")
     assert row is not None
-    assert row.change_token == "t1", "deferred replace must retry the new version later"
+    assert row.change_token == "t1", "deferred revision must retry the new version later"
 
 
 @pytest.mark.asyncio
-async def test_legacy_cursor_library_is_backfilled_before_trusting_doc_id(
-    tmp_path: Path,
-) -> None:
+async def test_revise_404_falls_back_to_create(tmp_path: Path) -> None:
+    """A cursor/find pointed at a doc IronRAG no longer has (manual delete,
+    library reset). The typed 404 must invalidate the cursor and fall back
+    to create so the next sweep is consistent."""
     adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t2")})
     state = _state(tmp_path)
     state.upsert(
@@ -558,18 +615,20 @@ async def test_legacy_cursor_library_is_backfilled_before_trusting_doc_id(
         item_id="1",
         change_token="t1",
         external_key="echo:page:1",
-        ironrag_document_id="doc-pre",
+        ironrag_document_id=str(DOC_PRE),
+        ironrag_library_id=str(LIB),
     )
 
-    class BlindIronRag(FakeIronRag):
-        async def find_document_by_external_key(self, library_id, external_key):
-            return None
+    class MissingDocumentIronRag(FakeIronRag):
+        async def create_revision(self, *args: Any, **kwargs: Any) -> OperationHandle:
+            raise _not_found_error()
 
-    ironrag = BlindIronRag()
-    ironrag.documents[(LIB, "echo:page:1")] = {
-        "id": "doc-pre",
-        "externalKey": "echo:page:1",
-    }
+    ironrag = MissingDocumentIronRag()
+    # No pre-seeded document for "echo:page:1" -- `find_document` (used by
+    # `push_item`'s existing-document lookup) also finds nothing, but the
+    # cursor still claims a document id, exercising the create_revision-404
+    # path via the cursor branch instead.
+    ironrag.documents[(LIB, "echo:page:1")] = _document(DOC_PRE, LIB, "echo:page:1")
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
@@ -581,91 +640,21 @@ async def test_legacy_cursor_library_is_backfilled_before_trusting_doc_id(
     ref = await _first(adapter.iter_items())
     out = await orchestrator.push_ref(ref)
 
-    assert out.action == "replaced"
-    assert ironrag.uploads == [], "must not upload with legacy cursor doc id"
-    assert ironrag.replaces and ironrag.replaces[0]["document_id"] == "doc-pre"
-    row = state.get("page", "1")
-    assert row is not None
-    assert row.ironrag_library_id == str(LIB)
-
-
-@pytest.mark.asyncio
-async def test_legacy_cursor_unknown_library_blocks_possible_duplicate_upload(
-    tmp_path: Path,
-) -> None:
-    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t2")})
-    state = _state(tmp_path)
-    state.upsert(
-        kind="page",
-        item_id="1",
-        change_token="t1",
-        external_key="echo:page:1",
-        ironrag_document_id="doc-pre",
-    )
-
-    class BlindIronRag(FakeIronRag):
-        async def find_document_by_external_key(self, library_id, external_key):
-            return None
-
-        async def get_document(self, document_id: str) -> dict[str, Any] | None:
-            return {"id": document_id, "externalKey": "echo:page:1"}
-
-    ironrag = BlindIronRag()
-    orchestrator = Orchestrator(
-        adapter=adapter,
-        ironrag=ironrag,  # type: ignore[arg-type]
-        router=_router(),
-        state=state,
-        policies=_policies(),
-    )
-
-    ref = await _first(adapter.iter_items())
-    with pytest.raises(IronRagError, match="refusing to upload"):
-        await orchestrator.push_ref(ref)
-
-    assert ironrag.uploads == []
-
-
-@pytest.mark.asyncio
-async def test_legacy_cursor_lookup_timeout_blocks_possible_duplicate_upload(
-    tmp_path: Path,
-) -> None:
-    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hi", updated_at="t2")})
-    state = _state(tmp_path)
-    state.upsert(
-        kind="page",
-        item_id="1",
-        change_token="t1",
-        external_key="echo:page:1",
-        ironrag_document_id="doc-pre",
-    )
-
-    class BlindIronRag(FakeIronRag):
-        async def find_document_by_external_key(self, library_id, external_key):
-            return None
-
-        async def get_document(self, document_id: str) -> dict[str, Any] | None:
-            raise httpx.ReadTimeout("synthetic timeout")
-
-    ironrag = BlindIronRag()
-    orchestrator = Orchestrator(
-        adapter=adapter,
-        ironrag=ironrag,  # type: ignore[arg-type]
-        router=_router(),
-        state=state,
-        policies=_policies(),
-        cursor_library_lookup_timeout_seconds=0.01,
-    )
-
-    ref = await _first(adapter.iter_items())
-    with pytest.raises(IronRagError, match="refusing to upload"):
-        await orchestrator.push_ref(ref)
-
-    assert ironrag.uploads == []
+    assert out.action == "created"
+    created_doc = ironrag.documents[(LIB, "echo:page:1")]
+    assert out.ironrag_document_id == str(created_doc.id)
 
 
 @pytest.mark.asyncio
 async def test_route_move_creates_new_target_and_reaps_old_target(tmp_path: Path) -> None:
+    """After routing config moves a kind to a new library, the orchestrator
+    creates the document under the new target AND reaps the stale document
+    from the previously-routed library. The redesigned reaper gets this
+    library set from a pre-sweep snapshot of cursor rows (every row already
+    carries a non-null ``library_id``, schema NOT NULL, S7.6) taken before
+    enumeration rewrites the moved item's own cursor row -- a synchronous
+    local read, unlike the removed `_cursor_libraries_by_kind`, which needed
+    remote lookups specifically to discover an unknown library_id."""
     adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t1")})
     state = _state(tmp_path)
     external_key = "echo:page:1"
@@ -674,14 +663,11 @@ async def test_route_move_creates_new_target_and_reaps_old_target(tmp_path: Path
         item_id="1",
         change_token="t1",
         external_key=external_key,
-        ironrag_document_id="doc-old",
+        ironrag_document_id=str(DOC_OLD),
         ironrag_library_id=str(LIB),
     )
     ironrag = FakeIronRag()
-    ironrag.documents[(LIB, external_key)] = {
-        "id": "doc-old",
-        "externalKey": external_key,
-    }
+    ironrag.documents[(LIB, external_key)] = _document(DOC_OLD, LIB, external_key)
     router = _router_to(LIB2)
     orchestrator = Orchestrator(
         adapter=adapter,
@@ -706,32 +692,40 @@ async def test_route_move_creates_new_target_and_reaps_old_target(tmp_path: Path
     assert report.created == 1
     assert report.reaped == 1
     assert report.errors == 0
-    assert (LIB, external_key) not in ironrag.documents
+    assert (LIB, external_key) not in ironrag.documents, "old-library doc must be reaped"
     assert (LIB2, external_key) in ironrag.documents
     row = state.get("page", "1")
     assert row is not None
-    assert row.ironrag_document_id == "doc-100"
     assert row.ironrag_library_id == str(LIB2)
 
 
 @pytest.mark.asyncio
-async def test_route_move_from_legacy_cursor_reaps_old_target(tmp_path: Path) -> None:
-    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t1")})
+async def test_unmoved_kind_is_not_reaped_from_libraries_it_never_used(
+    tmp_path: Path,
+) -> None:
+    """A kind whose items were never routed to some other library must not
+    have that unrelated library swept in -- the pre-sweep snapshot only
+    widens the reap scope to libraries a *cursor row for this kind* actually
+    names, not every library the connector has ever touched."""
+    adapter = EchoAdapter({})
     state = _state(tmp_path)
-    external_key = "echo:page:1"
+    external_key = "echo:page:stable"
     state.upsert(
         kind="page",
-        item_id="1",
+        item_id="stable",
         change_token="t1",
         external_key=external_key,
-        ironrag_document_id="doc-old",
+        ironrag_document_id=str(DOC_PRE),
+        ironrag_library_id=str(LIB),
     )
     ironrag = FakeIronRag()
-    ironrag.documents[(LIB, external_key)] = {
-        "id": "doc-old",
-        "externalKey": external_key,
-    }
-    router = _router_to(LIB2)
+    ironrag.documents[(LIB, external_key)] = _document(DOC_PRE, LIB, external_key)
+    # A document that happens to live in LIB2, a library this kind's cursor
+    # never references -- must survive the sweep untouched.
+    ironrag.documents[(LIB2, "echo:page:unrelated")] = _document(
+        DOC_OLD, LIB2, "echo:page:unrelated"
+    )
+    router = _router()
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
@@ -752,21 +746,13 @@ async def test_route_move_from_legacy_cursor_reaps_old_target(tmp_path: Path) ->
 
     report = await manager.run_once(reason="test")
 
-    assert report.created == 1
-    assert report.reaped == 1
-    assert report.errors == 0
-    assert (LIB, external_key) not in ironrag.documents
-    assert (LIB2, external_key) in ironrag.documents
-    row = state.get("page", "1")
-    assert row is not None
-    assert row.ironrag_document_id == "doc-100"
-    assert row.ironrag_library_id == str(LIB2)
+    assert report.reaped == 1, "the stable doc itself has no source item this sweep"
+    assert (LIB, external_key) not in ironrag.documents, "stable doc has no source item -- reaped"
+    assert (LIB2, "echo:page:unrelated") in ironrag.documents, "unrelated library left untouched"
 
 
 @pytest.mark.asyncio
 async def test_reap_respects_ignore_policy(tmp_path: Path) -> None:
-    from ironrag_connector.source import SourceItemRef as Ref
-
     adapter = EchoAdapter({})
     state = _state(tmp_path)
     ironrag = FakeIronRag()
@@ -777,194 +763,45 @@ async def test_reap_respects_ignore_policy(tmp_path: Path) -> None:
         state=state,
         policies=_policies(),
     )
-    ref = Ref(item_id="1", kind="image", external_key="echo:image:1")
+    ref = SourceItemRef(item_id="1", kind="image", external_key="echo:image:1")
     out = await orchestrator.reap_orphan(
-        ref, LIB, "doc-x", PushPolicy(on_missing=DeleteAction.IGNORE)
+        ref, LIB, str(DOC_PRE), PushPolicy(on_missing=DeleteAction.IGNORE)
     )
     assert out.action == "skipped_missing"
     assert ironrag.deletes == []
 
 
 @pytest.mark.asyncio
-async def test_cursor_library_timeout_does_not_abort_sweep_before_enumeration(
-    tmp_path: Path,
-) -> None:
-    adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t1")})
-    state = _state(tmp_path)
-    external_key = "echo:page:1"
-    state.upsert(
-        kind="page",
-        item_id="1",
-        change_token="t1",
-        external_key=external_key,
-        ironrag_document_id="doc-pre",
-    )
-
-    class TimeoutBackfillIronRag(FakeIronRag):
-        async def get_document(self, document_id: str) -> dict[str, Any] | None:
-            raise httpx.ReadTimeout("synthetic timeout")
-
-    ironrag = TimeoutBackfillIronRag()
-    ironrag.documents[(LIB, external_key)] = {
-        "id": "doc-pre",
-        "externalKey": external_key,
-    }
-    router = _router()
-    orchestrator = Orchestrator(
-        adapter=adapter,
-        ironrag=ironrag,  # type: ignore[arg-type]
-        router=router,
-        state=state,
-        policies=_policies(),
-        cursor_library_lookup_timeout_seconds=0.01,
-    )
-    manager = SyncManager(
-        adapter=adapter,
-        ironrag=ironrag,  # type: ignore[arg-type]
-        orchestrator=orchestrator,
-        router=router,
-        state=state,
-        policies=_policies(),
-        concurrency=1,
-        interval_seconds=60,
-        cursor_library_lookup_timeout_seconds=0.01,
-    )
-
-    report = await manager.run_once(reason="test")
-
-    assert report.items_seen == 1
-    assert report.noop_unchanged == 1
-    assert report.errors == 0
-    row = state.get("page", "1")
-    assert row is not None
-    assert row.ironrag_library_id == str(LIB)
-
-
-@pytest.mark.asyncio
-async def test_pre_enumeration_cursor_backfill_preserves_pushed_timestamp(
-    tmp_path: Path,
-) -> None:
+async def test_reap_orphan_deletes_and_polls_to_terminal(tmp_path: Path) -> None:
     adapter = EchoAdapter({})
     state = _state(tmp_path)
-    external_key = "echo:page:1"
-    state.upsert(
-        kind="page",
-        item_id="1",
-        change_token="t1",
-        external_key=external_key,
-        ironrag_document_id="doc-pre",
-    )
-    before = state.get("page", "1")
-    assert before is not None
-
     ironrag = FakeIronRag()
-    ironrag.documents[(LIB, external_key)] = {
-        "id": "doc-pre",
-        "externalKey": external_key,
-    }
-    router = _router()
+    ironrag.documents[(LIB, "echo:image:1")] = _document(DOC_PRE, LIB, "echo:image:1")
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
-        router=router,
+        router=_router(),
         state=state,
         policies=_policies(),
     )
-    manager = SyncManager(
-        adapter=adapter,
-        ironrag=ironrag,  # type: ignore[arg-type]
-        orchestrator=orchestrator,
-        router=router,
-        state=state,
-        policies=_policies(),
-        concurrency=1,
-        interval_seconds=60,
-    )
-
-    libraries = await manager._cursor_libraries_by_kind()
-
-    row = state.get("page", "1")
-    assert row is not None
-    assert row.change_token == "t1"
-    assert row.last_pushed_at == before.last_pushed_at
-    assert row.ironrag_library_id == str(LIB)
-    assert libraries == {"page": {LIB}}
+    ref = SourceItemRef(item_id="1", kind="image", external_key="echo:image:1")
+    out = await orchestrator.reap_orphan(ref, LIB, str(DOC_PRE), PushPolicy())
+    assert out.action == "deleted"
+    assert ironrag.deletes == [str(DOC_PRE)]
+    assert (LIB, "echo:image:1") not in ironrag.documents
 
 
 @pytest.mark.asyncio
-async def test_reaper_uses_partial_cursor_libraries_without_false_delete(
-    tmp_path: Path,
-) -> None:
-    adapter = EchoAdapter({})
-    state = _state(tmp_path)
-    state.upsert(
-        kind="page",
-        item_id="known-old",
-        change_token="t1",
-        external_key="echo:page:known-old",
-        ironrag_document_id="doc-known",
-        ironrag_library_id=str(LIB),
-    )
-    state.upsert(
-        kind="page",
-        item_id="unknown-old",
-        change_token="t1",
-        external_key="echo:page:unknown-old",
-        ironrag_document_id="doc-unknown",
-    )
-
-    class PartialBackfillIronRag(FakeIronRag):
-        async def get_document(self, document_id: str) -> dict[str, Any] | None:
-            if document_id == "doc-unknown":
-                raise httpx.ReadTimeout("synthetic timeout")
-            return await super().get_document(document_id)
-
-    ironrag = PartialBackfillIronRag()
-    ironrag.documents[(LIB, "echo:page:known-old")] = {
-        "id": "doc-known",
-        "externalKey": "echo:page:known-old",
-    }
-    ironrag.documents[(LIB3, "echo:page:unknown-old")] = {
-        "id": "doc-unknown",
-        "externalKey": "echo:page:unknown-old",
-    }
-    router = _router_to(LIB2)
-    orchestrator = Orchestrator(
-        adapter=adapter,
-        ironrag=ironrag,  # type: ignore[arg-type]
-        router=router,
-        state=state,
-        policies=_policies(),
-    )
-    manager = SyncManager(
-        adapter=adapter,
-        ironrag=ironrag,  # type: ignore[arg-type]
-        orchestrator=orchestrator,
-        router=router,
-        state=state,
-        policies=_policies(),
-        concurrency=1,
-        interval_seconds=60,
-        cursor_library_lookup_timeout_seconds=0.01,
-    )
-
-    report = await manager.run_once(reason="test")
-
-    assert report.reaped == 1
-    assert report.errors == 0
-    assert (LIB, "echo:page:known-old") not in ironrag.documents
-    assert (LIB3, "echo:page:unknown-old") in ironrag.documents
-
-
-@pytest.mark.asyncio
-async def test_idempotency_key_is_content_addressed(tmp_path: Path) -> None:
-    """The default idempotency key must derive from the payload bytes, not
+async def test_revision_idempotency_key_is_content_addressed(tmp_path: Path) -> None:
+    """The revision idempotency key must derive from the payload bytes, not
     the change_token, so a re-rendered payload for the same logical version
-    does not collide (409) with a stuck prior attempt, and the upload and
-    replace key spaces stay separate."""
+    does not collide (409 idempotency_conflict) with a stuck prior attempt.
+    Create no longer takes an idempotency key at all (plan S7.1/S7.2) -- only
+    revisions and deletes do -- so this is exercised via a replace."""
     adapter = EchoAdapter({})
     state = _state(tmp_path)
     ironrag = FakeIronRag()
+    ironrag.documents[(LIB, "echo:page:1")] = _document(DOC_PRE, LIB, "echo:page:1")
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
@@ -990,16 +827,22 @@ async def test_idempotency_key_is_content_addressed(tmp_path: Path) -> None:
     route = _router().resolve(_item(b"a").ref)
 
     await orchestrator.push_item(_item(b"<p>render A</p>"), route, PushPolicy())
-    first_key = ironrag.uploads[0]["idempotency_key"]
-    # Same change_token, different bytes → different key (no false conflict).
-    state.delete("page", "1")
+    first_key = ironrag.revisions[0]["idempotency_key"]
+    # Same change_token, different bytes -> different key (no false conflict).
+    state.upsert(
+        kind="page",
+        item_id="1",
+        change_token="t-reset",
+        external_key="echo:page:1",
+        ironrag_document_id=str(DOC_PRE),
+        ironrag_library_id=str(LIB),
+    )
     orchestrator.reset_sweep_cache()
-    ironrag.documents.clear()
     await orchestrator.push_item(_item(b"<p>render B (different)</p>"), route, PushPolicy())
-    second_key = ironrag.uploads[1]["idempotency_key"]
+    second_key = ironrag.revisions[1]["idempotency_key"]
 
     assert "vSAME" not in first_key, "key must not embed change_token"
-    assert ":upload:" in first_key, "op must scope the key space"
+    assert ":revision:" in first_key, "op must scope the key space"
     assert first_key != second_key, "different payload must yield a different key"
 
 
@@ -1007,22 +850,21 @@ async def test_idempotency_key_is_content_addressed(tmp_path: Path) -> None:
 async def test_noop_persists_doc_id_to_cursor(tmp_path: Path) -> None:
     """A seed cursor that knows change_token but not the document id must be
     upgraded with the discovered id on the first sweep, so later sweeps
-    short-circuit with zero list-endpoint calls."""
+    short-circuit with zero find calls."""
     adapter = EchoAdapter({"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t1")})
     state = _state(tmp_path)
-    # Seed cursor: change_token known, document id absent.
+    ironrag = FakeIronRag()
+    ironrag.documents[(LIB, "echo:page:1")] = _document(DOC_PRE, LIB, "echo:page:1")
+    # Seed cursor: change_token known, document id absent -- must still
+    # supply a library id, since it is NOT NULL from schema creation.
     state.upsert(
         kind="page",
         item_id="1",
         change_token="t1",
         external_key="echo:page:1",
         ironrag_document_id=None,
+        ironrag_library_id=str(LIB),
     )
-    ironrag = FakeIronRag()
-    ironrag.documents[(LIB, "echo:page:1")] = {
-        "id": "doc-pre",
-        "externalKey": "echo:page:1",
-    }
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
@@ -1034,11 +876,11 @@ async def test_noop_persists_doc_id_to_cursor(tmp_path: Path) -> None:
     ref = await _first(adapter.iter_items())
     out = await orchestrator.push_ref(ref)
     assert out.action == "noop_unchanged"
-    assert out.ironrag_document_id == "doc-pre"
+    assert out.ironrag_document_id == str(DOC_PRE)
     assert ironrag.find_calls == 1
     row = state.get("page", "1")
     assert row is not None
-    assert row.ironrag_document_id == "doc-pre"
+    assert row.ironrag_document_id == str(DOC_PRE)
 
     # Second sweep: cursor now knows the id, so no further find calls.
     out2 = await orchestrator.push_ref(ref)
@@ -1048,9 +890,9 @@ async def test_noop_persists_doc_id_to_cursor(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_dependent_uploaded_with_parent_external_key(tmp_path: Path) -> None:
-    """A page with an image dependent must upload the dependent declaring its
+    """A page with an image dependent must create the dependent declaring its
     source page as parent (parent_external_key == parent.ref.external_key),
-    while the primary page uploads with parent_external_key None. This is the
+    while the primary page creates with parent_external_key None. This is the
     single orchestrator injection point that gives every connector correct
     parentage without an adapter change."""
 
@@ -1099,7 +941,7 @@ async def test_dependent_uploaded_with_parent_external_key(tmp_path: Path) -> No
     assert len(out.dependent_outcomes) == 1
     assert out.dependent_outcomes[0].action == "created"
 
-    by_key = {u["external_key"]: u for u in ironrag.uploads}
+    by_key = {c["external_key"]: c for c in ironrag.creates}
     primary = by_key["echo:page:1"]
     dependent = by_key["echo:image:img-1"]
     assert primary["parent_external_key"] is None, "primary stays role=primary"
@@ -1136,8 +978,14 @@ async def test_dependent_waits_when_primary_replace_is_deferred(tmp_path: Path) 
                 dependents=(image,),
             )
 
-    class TimeoutReplaceIronRag(FakeIronRag):
-        async def replace_document(self, **kwargs: Any) -> dict[str, Any]:
+    class TimeoutReviseIronRag(FakeIronRag):
+        async def wait_for_operation(
+            self,
+            operation_id: UUID | str,
+            *,
+            poll_interval: float | None = None,
+            budget: float | None = None,
+        ) -> OperationStatus:
             raise IronRagMutationTimeoutError("synthetic mutation timeout")
 
     adapter = PageWithImageAdapter(
@@ -1149,10 +997,11 @@ async def test_dependent_waits_when_primary_replace_is_deferred(tmp_path: Path) 
         item_id="1",
         change_token="t1",
         external_key="echo:page:1",
-        ironrag_document_id="doc-pre",
+        ironrag_document_id=str(DOC_PRE),
         ironrag_library_id=str(LIB),
     )
-    ironrag = TimeoutReplaceIronRag()
+    ironrag = TimeoutReviseIronRag()
+    ironrag.documents[(LIB, "echo:page:1")] = _document(DOC_PRE, LIB, "echo:page:1")
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
@@ -1166,7 +1015,7 @@ async def test_dependent_waits_when_primary_replace_is_deferred(tmp_path: Path) 
     assert out.action == "skipped_changed"
     assert out.deferred is True
     assert out.dependent_outcomes == ()
-    assert ironrag.uploads == []
+    assert ironrag.creates == []
     row = state.get("page", "1")
     assert row is not None
     assert row.change_token == "t1"
@@ -1176,6 +1025,14 @@ async def test_dependent_waits_when_primary_replace_is_deferred(tmp_path: Path) 
 async def test_dependent_deferral_restores_parent_cursor_for_retry(
     tmp_path: Path,
 ) -> None:
+    """The dependent image already has an IronRAG document (so its write is
+    a revise, not a create -- only revise supports poll-timeout deferral in
+    the redesigned client, since create is now a single synchronous call
+    with no polling phase to time out on). Its first revision poll times
+    out; the orchestrator must defer the whole item (restoring the parent's
+    cursor for retry) rather than partially advancing state, and the second
+    sweep must succeed once the transient failure clears."""
+
     class PageWithImageAdapter(EchoAdapter):
         async def fetch(self, ref: SourceItemRef) -> SourceItem | None:
             page = await super().fetch(ref)
@@ -1202,17 +1059,31 @@ async def test_dependent_deferral_restores_parent_cursor_for_retry(
                 dependents=(image,),
             )
 
-    class OneTimeoutImageUploadIronRag(FakeIronRag):
+    class OneTimeoutImageReviseIronRag(FakeIronRag):
         def __init__(self) -> None:
             super().__init__()
-            self.image_upload_attempts = 0
+            self.image_op_polls = 0
+            self._image_op_ids: set[UUID] = set()
 
-        async def upload_document(self, **kwargs: Any) -> dict[str, Any]:
-            if kwargs["external_key"] == "echo:image:img-1":
-                self.image_upload_attempts += 1
-                if self.image_upload_attempts == 1:
+        async def create_revision(self, document_id: Any, **kwargs: Any) -> OperationHandle:
+            handle = await super().create_revision(document_id, **kwargs)
+            if str(document_id) == str(DOC_IMAGE_PRE):
+                self._image_op_ids.add(handle.operation_id)
+            return handle
+
+        async def wait_for_operation(
+            self,
+            operation_id: UUID | str,
+            *,
+            poll_interval: float | None = None,
+            budget: float | None = None,
+        ) -> OperationStatus:
+            op_id = UUID(str(operation_id))
+            if op_id in self._image_op_ids:
+                self.image_op_polls += 1
+                if self.image_op_polls == 1:
                     raise IronRagMutationTimeoutError("synthetic mutation timeout")
-            return await super().upload_document(**kwargs)
+            return await super().wait_for_operation(operation_id)
 
     adapter = PageWithImageAdapter(
         {"1": EchoPage(item_id="1", title="One", body="hello", updated_at="t2")}
@@ -1223,14 +1094,22 @@ async def test_dependent_deferral_restores_parent_cursor_for_retry(
         item_id="1",
         change_token="t1",
         external_key="echo:page:1",
-        ironrag_document_id="doc-pre",
+        ironrag_document_id=str(DOC_PRE),
         ironrag_library_id=str(LIB),
     )
-    ironrag = OneTimeoutImageUploadIronRag()
-    ironrag.documents[(LIB, "echo:page:1")] = {
-        "id": "doc-pre",
-        "externalKey": "echo:page:1",
-    }
+    state.upsert(
+        kind="image",
+        item_id="img-1",
+        change_token="i0",
+        external_key="echo:image:img-1",
+        ironrag_document_id=str(DOC_IMAGE_PRE),
+        ironrag_library_id=str(LIB),
+    )
+    ironrag = OneTimeoutImageReviseIronRag()
+    ironrag.documents[(LIB, "echo:page:1")] = _document(DOC_PRE, LIB, "echo:page:1")
+    ironrag.documents[(LIB, "echo:image:img-1")] = _document(
+        DOC_IMAGE_PRE, LIB, "echo:image:img-1"
+    )
     orchestrator = Orchestrator(
         adapter=adapter,
         ironrag=ironrag,  # type: ignore[arg-type]
@@ -1245,13 +1124,15 @@ async def test_dependent_deferral_restores_parent_cursor_for_retry(
     assert first.action == "replaced"
     assert first.deferred is True
     assert len(first.dependent_outcomes) == 1
-    assert first.dependent_outcomes[0].action == "skipped_new"
+    assert first.dependent_outcomes[0].action == "skipped_changed"
     assert first.dependent_outcomes[0].deferred is True
-    assert ironrag.image_upload_attempts == 1
+    assert ironrag.image_op_polls == 1
     parent_row = state.get("page", "1")
     assert parent_row is not None
     assert parent_row.change_token == "t1"
-    assert state.get("image", "img-1") is None
+    image_row = state.get("image", "img-1")
+    assert image_row is not None
+    assert image_row.change_token == "i0"
 
     orchestrator.reset_sweep_cache()
     second = await orchestrator.push_ref(ref)
@@ -1259,12 +1140,14 @@ async def test_dependent_deferral_restores_parent_cursor_for_retry(
     assert second.action == "replaced"
     assert second.deferred is False
     assert len(second.dependent_outcomes) == 1
-    assert second.dependent_outcomes[0].action == "created"
-    assert ironrag.image_upload_attempts == 2
-    assert state.get("page", "1").change_token == "t2"
-    image_row = state.get("image", "img-1")
-    assert image_row is not None
-    assert image_row.change_token == "i1"
+    assert second.dependent_outcomes[0].action == "replaced"
+    assert ironrag.image_op_polls == 2
+    page_row_after = state.get("page", "1")
+    assert page_row_after is not None
+    assert page_row_after.change_token == "t2"
+    image_row_after = state.get("image", "img-1")
+    assert image_row_after is not None
+    assert image_row_after.change_token == "i1"
 
 
 async def _first(it: Any) -> Any:

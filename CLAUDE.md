@@ -171,3 +171,8 @@ unique-violation 500.
   specific corpora belong in this repo. Examples and tests must use
   synthetic identifiers only; real deployment values live in operator
   `.env.local` files outside the tree.
+
+## Локальные `.env`
+
+- Для runtime/deploy/CI переменных сначала проверяй `.env` рядом с этим `AGENTS.md`; если рядом нет, ищи ближайший `.env` в корне текущего repo/workspace перед внешними источниками.
+- Значения `.env` считать секретами: не печатать и не цитировать; в чат/документы писать только имена ключей.

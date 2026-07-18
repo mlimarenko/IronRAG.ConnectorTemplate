@@ -25,14 +25,12 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-import httpx
-
-from .ironrag import IronRagClient, IronRagError, document_library_id
+from .ironrag import IronRagClient, IronRagError
 from .observability import get_logger
 from .orchestrator import OrchestrationOutcome, Orchestrator
 from .policy import DeleteAction
 from .routing import PolicyOverrides, Router, RoutingReloader
-from .source import SourceAdapter
+from .source import SourceAdapter, SourceItemRef
 from .state import StateStore
 
 log = get_logger(__name__)
@@ -92,8 +90,6 @@ class SyncManager:
         concurrency: int,
         interval_seconds: int,
         item_timeout_seconds: float = 300.0,
-        cursor_library_lookup_timeout_seconds: float = 5.0,
-        cursor_library_lookup_max_rows_per_sweep: int = 16,
         reaper_list_timeout_seconds: float = 30.0,
         routing_reloader: RoutingReloader | None = None,
     ) -> None:
@@ -106,8 +102,6 @@ class SyncManager:
         self._concurrency = concurrency
         self._interval = interval_seconds
         self._item_timeout = item_timeout_seconds
-        self._cursor_library_lookup_timeout = cursor_library_lookup_timeout_seconds
-        self._cursor_library_lookup_max_rows = cursor_library_lookup_max_rows_per_sweep
         self._reaper_list_timeout = reaper_list_timeout_seconds
         self._routing_reloader = routing_reloader
         self._run_lock = asyncio.Lock()
@@ -136,10 +130,25 @@ class SyncManager:
         # IronRAG mutation per sweep.
         self._orchestrator.reset_sweep_cache()
 
+        # Snapshot each kind's cursor-known libraries BEFORE enumeration
+        # touches any cursor row. A routing config change moves a kind to a
+        # new library without deleting old cursor rows; the item that moved
+        # gets its own cursor row rewritten to the new library_id during
+        # THIS sweep's push, so reading this snapshot after enumeration
+        # would already have lost the old library. Capturing it first is
+        # what makes the old-library reap possible at all -- a synchronous
+        # local read only (every cursor row already carries a non-null
+        # library_id, schema NOT NULL, S7.6), unlike the removed
+        # `_cursor_libraries_by_kind` this replaces, which needed remote
+        # lookups specifically to discover an unknown library_id.
+        pre_sweep_cursor_libs: dict[str, set[UUID]] = {
+            kind: {UUID(row.ironrag_library_id) for row in self._state.items_of_kind(kind)}
+            for kind in self._adapter.primary_kinds
+        }
+
         sem = asyncio.Semaphore(self._concurrency)
         seen: dict[str, set[str]] = {k: set() for k in self._adapter.kinds}
         seen_targets: dict[tuple[str, str], set[UUID]] = {}
-        cursor_libraries = await self._cursor_libraries_by_kind()
         tasks: list[asyncio.Task[None]] = []
 
         async def process(ref: Any) -> None:
@@ -221,7 +230,7 @@ class SyncManager:
             report.errors += 1
 
         if sweep_completed:
-            await self._reap(seen, seen_targets, cursor_libraries, report)
+            await self._reap(seen, seen_targets, pre_sweep_cursor_libs, report)
 
         report.finished_at = datetime.now(tz=UTC)
         log.info(
@@ -235,32 +244,34 @@ class SyncManager:
         self,
         seen: dict[str, set[str]],
         seen_targets: dict[tuple[str, str], set[UUID]],
-        cursor_libraries: dict[str, set[UUID]],
+        pre_sweep_cursor_libs: dict[str, set[UUID]],
         report: SyncReport,
     ) -> None:
         """Delete IronRAG docs whose source item vanished.
 
-        Only ``primary_kinds`` are reaped — kinds enumerated directly by
+        Only ``primary_kinds`` are reaped -- kinds enumerated directly by
         ``iter_items()``. Dependent kinds (attachments, images) don't
         participate because their absence from ``seen`` may simply mean
         the parent noop'd and we didn't re-fetch.
         """
-        current_target_libs = self._router.target_libraries()
-        primary = getattr(self._adapter, "primary_kinds", self._adapter.kinds)
-        for kind in primary:
+        router_target_libs = self._router.target_libraries()
+        for kind in self._adapter.primary_kinds:
             policy = self._policies.for_kind(kind)
             if policy.on_missing is DeleteAction.IGNORE:
                 continue
             prefix = self._adapter.external_key(kind, "")
-            if not prefix.endswith(":"):
-                prefix = prefix + ""  # adapter may already include trailing colon
-            target_libs = current_target_libs | cursor_libraries.get(kind, set())
+            # Union in every library a cursor row for this kind pointed at
+            # BEFORE this sweep touched anything (see the snapshot taken in
+            # `_run_once_unlocked`), not just the router's *current*
+            # targets. A routing config change moves a kind to a new
+            # library without deleting the old cursor rows -- without this,
+            # a moved-away library's now-orphaned documents would never be
+            # reaped again.
+            target_libs = router_target_libs | pre_sweep_cursor_libs.get(kind, set())
             for library_id in target_libs:
                 try:
                     async with asyncio.timeout(self._reaper_list_timeout):
-                        pairs = await self._ironrag.list_documents_by_external_key_prefix(
-                            library_id, prefix
-                        )
+                        pairs = await self._list_by_prefix(library_id, prefix)
                 except TimeoutError:
                     log.warning(
                         "sync.reap.list_timeout",
@@ -288,8 +299,6 @@ class SyncManager:
                         kind, parsed_item_id, library_id, seen, seen_targets
                     ):
                         continue
-                    from .source import SourceItemRef
-
                     reap_ref = SourceItemRef(
                         item_id=parsed_item_id,
                         kind=kind,
@@ -309,100 +318,24 @@ class SyncManager:
                         )
                         report.errors += 1
 
-    async def _cursor_libraries_by_kind(self) -> dict[str, set[UUID]]:
-        libraries: dict[str, set[UUID]] = {}
-        primary = getattr(self._adapter, "primary_kinds", self._adapter.kinds)
-        lookup_sem = asyncio.Semaphore(max(1, min(self._concurrency, 8)))
-        remaining_remote_lookups = self._cursor_library_lookup_max_rows
-        deferred: dict[str, int] = {}
+    async def _list_by_prefix(self, library_id: UUID, prefix: str) -> list[tuple[str, str]]:
+        """Every ``(externalKey, documentId)`` pair under ``prefix`` in a library.
 
-        async def resolve_row(row: Any) -> tuple[str, UUID] | None:
-            library_id_raw = row.ironrag_library_id
-            if library_id_raw is None and row.ironrag_document_id:
-                try:
-                    async with lookup_sem:
-                        async with asyncio.timeout(self._cursor_library_lookup_timeout):
-                            document = await self._ironrag.get_document(row.ironrag_document_id)
-                except TimeoutError:
-                    log.warning(
-                        "sync.reap.cursor_library_lookup_timeout",
-                        kind=row.kind,
-                        item_id=row.item_id,
-                        document_id=row.ironrag_document_id,
-                        timeout_seconds=self._cursor_library_lookup_timeout,
-                    )
-                    return None
-                except (IronRagError, httpx.TransportError) as exc:
-                    log.warning(
-                        "sync.reap.cursor_library_lookup_error",
-                        kind=row.kind,
-                        item_id=row.item_id,
-                        document_id=row.ironrag_document_id,
-                        error_type=type(exc).__name__,
-                        error=str(exc) or repr(exc),
-                    )
-                    return None
-                if document is None:
-                    self._state.delete(row.kind, row.item_id)
-                    return None
-                library_id_raw = document_library_id(document)
-                if library_id_raw is None:
-                    log.warning(
-                        "sync.reap.cursor_library_unknown",
-                        kind=row.kind,
-                        item_id=row.item_id,
-                        document_id=row.ironrag_document_id,
-                    )
-                    return None
-                self._state.backfill_document_identity(
-                    kind=row.kind,
-                    item_id=row.item_id,
-                    external_key=row.external_key,
-                    ironrag_document_id=row.ironrag_document_id,
-                    ironrag_library_id=library_id_raw,
-                )
-            if not library_id_raw:
-                return None
-            try:
-                return row.kind, UUID(library_id_raw)
-            except ValueError:
-                log.warning(
-                    "sync.reap.invalid_cursor_library",
-                    kind=row.kind,
-                    item_id=row.item_id,
-                    library_id=library_id_raw,
-                )
-                return None
-
-        for kind in primary:
-            rows = self._state.items_of_kind(kind)
-            selected_rows: list[Any] = []
-            for row in rows:
-                if row.ironrag_library_id or not row.ironrag_document_id:
-                    selected_rows.append(row)
-                    continue
-                if remaining_remote_lookups > 0:
-                    selected_rows.append(row)
-                    remaining_remote_lookups -= 1
-                    continue
-                deferred[kind] = deferred.get(kind, 0) + 1
-            results = await asyncio.gather(
-                *(resolve_row(row) for row in selected_rows),
-                return_exceptions=False,
-            )
-            for result in results:
-                if result is None:
-                    continue
-                result_kind, library_id = result
-                libraries.setdefault(result_kind, set()).add(library_id)
-        for kind, count in deferred.items():
-            log.info(
-                "sync.reap.cursor_library_lookup_deferred",
-                kind=kind,
-                rows=count,
-                max_rows_per_sweep=self._cursor_library_lookup_max_rows,
-            )
-        return libraries
+        Built on the single ``list_documents`` walk (plan S7.7: no
+        independent pagination reimplementation) narrowed server-side via
+        ``search`` -- the same ILIKE-substring narrowing
+        ``IronRagClient.find_document`` used to do by hand, now just a
+        client-side ``startswith`` filter over one search-narrowed walk
+        instead of a full unfiltered scan. There is no server-side prefix
+        filter on the list endpoint (plan S7.1's field list is cursor/
+        limit/search/externalKey/includeDeleted/status), so this is the
+        correct way to reconstruct prefix listing from that surface.
+        """
+        pairs: list[tuple[str, str]] = []
+        async for document in self._ironrag.list_documents(library_id, search=prefix):
+            if document.external_key.startswith(prefix):
+                pairs.append((document.external_key, str(document.id)))
+        return pairs
 
     async def run_forever(self, cancel_event: asyncio.Event) -> None:
         while True:

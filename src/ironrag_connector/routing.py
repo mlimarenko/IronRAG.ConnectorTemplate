@@ -34,7 +34,7 @@ is recorded as ``unrouted`` and skipped (logged loudly).
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -345,10 +345,6 @@ def _validate_resolved_targets(
                 f"catalog resolver returned '{target.library_ref}' for '{library_ref}'"
             )
     return result
-
-
-def known_kinds(rules: Iterable[RouteRule]) -> set[str]:
-    return set()  # reserved for future per-rule kind filters
 
 
 def _mtime_ns(path: Path) -> int:

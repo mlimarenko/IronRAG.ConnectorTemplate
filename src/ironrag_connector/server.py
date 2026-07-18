@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -112,7 +113,6 @@ def build_app(
         router=router,
         state=state,
         policies=policies,
-        cursor_library_lookup_timeout_seconds=(settings.cursor_library_lookup_timeout_seconds),
     )
     sync_manager = SyncManager(
         adapter=adapter,
@@ -124,10 +124,6 @@ def build_app(
         concurrency=settings.sync_concurrency,
         interval_seconds=settings.sync_interval_seconds,
         item_timeout_seconds=settings.sync_item_timeout_seconds,
-        cursor_library_lookup_timeout_seconds=(settings.cursor_library_lookup_timeout_seconds),
-        cursor_library_lookup_max_rows_per_sweep=(
-            settings.cursor_library_lookup_max_rows_per_sweep
-        ),
         reaper_list_timeout_seconds=settings.reaper_list_timeout_seconds,
         routing_reloader=routing_reloader,
     )
@@ -242,8 +238,6 @@ def _mount_webhook(
             handler.extra_auth(request, body)
         await routing_reloader.reload_if_changed()
         try:
-            import json
-
             payload = json.loads(body.decode("utf-8") or "{}")
         except (UnicodeDecodeError, ValueError) as exc:
             raise HTTPException(

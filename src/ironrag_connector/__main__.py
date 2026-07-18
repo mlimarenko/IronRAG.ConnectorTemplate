@@ -8,8 +8,6 @@ adapter.
 
 from __future__ import annotations
 
-import uvicorn
-
 
 def main() -> None:
     raise SystemExit(
@@ -21,8 +19,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-# Re-export for convenience when a downstream connector does
-# `uvicorn my_connector.server:app`.
-__all__ = ["uvicorn"]

@@ -72,6 +72,7 @@ def _settings(tmp_path: Path) -> BaseConnectorSettings:
     return BaseConnectorSettings(
         ironrag_base_url="http://ironrag.invalid",
         ironrag_api_token="test-token",
+        request_timeout_seconds=60.0,
         routing_config_path=routing_path,
         state_db_path=tmp_path / "state.sqlite",
         pidfile_path=tmp_path / "connector.pid",

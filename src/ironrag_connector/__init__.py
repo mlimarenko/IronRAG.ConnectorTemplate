@@ -14,7 +14,24 @@ endpoints, the single-instance pidfile lock, and structured logging.
 from __future__ import annotations
 
 from .config import BaseConnectorSettings, PolicyDefaults, RunMode
-from .ironrag import IronRagCatalogError, IronRagClient, IronRagError
+from .ironrag import (
+    DocumentPage,
+    DocumentResource,
+    IronRagCatalogError,
+    IronRagClient,
+    IronRagConflictError,
+    IronRagDuplicateContentError,
+    IronRagError,
+    IronRagMutationTimeoutError,
+    IronRagNotFoundError,
+    IronRagOperationFailedError,
+    IronRagProblemError,
+    OperationHandle,
+    OperationProgress,
+    OperationStatus,
+    OperationStatusValue,
+    ProblemDetails,
+)
 from .observability import configure_logging, get_logger
 from .orchestrator import OrchestrationOutcome, Orchestrator
 from .policy import DeleteAction, PushPolicy, UpdateAction, UpsertAction
@@ -37,13 +54,26 @@ from .sync import SyncAlreadyRunningError, SyncManager, SyncReport
 __all__ = [
     "BaseConnectorSettings",
     "DeleteAction",
+    "DocumentPage",
+    "DocumentResource",
     "IronRagCatalogError",
     "IronRagClient",
+    "IronRagConflictError",
+    "IronRagDuplicateContentError",
     "IronRagError",
+    "IronRagMutationTimeoutError",
+    "IronRagNotFoundError",
+    "IronRagOperationFailedError",
+    "IronRagProblemError",
+    "OperationHandle",
+    "OperationProgress",
+    "OperationStatus",
+    "OperationStatusValue",
     "OrchestrationOutcome",
     "Orchestrator",
     "PolicyDefaults",
     "PolicyOverrides",
+    "ProblemDetails",
     "PushPolicy",
     "ResolvedLibraryTarget",
     "ResolvedRoute",
