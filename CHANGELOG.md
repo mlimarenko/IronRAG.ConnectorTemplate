@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1 — 2026-07-29
+
+- **Fix:** stop sending the redundant `library_id` multipart field when
+  creating a document. The library is already identified by the path segment,
+  and IronRAG's multipart parser rejects any field outside its allow-list with
+  `400 "unknown multipart field"` — so every file-backed upload failed. The
+  previous comment claiming the server *required* the field described an older
+  API; the path parameter is the single source of truth.
+
 ## 0.2.0 — 2026-07-18
 
 - **Breaking:** rewrote `IronRagClient` for the redesigned IronRAG REST v2

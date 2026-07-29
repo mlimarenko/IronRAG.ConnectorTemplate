@@ -619,14 +619,12 @@ class IronRagClient:
             if not file_name or not mime_type:
                 raise ValueError("file_name and mime_type are required when file_bytes is set")
             files = {"file": (file_name, file_bytes, mime_type)}
-            # `library_id` is required by the server's multipart parser even
-            # though this endpoint is already scoped by the path segment --
-            # the parser (shared plumbing) rejects a multipart body with no
-            # `library_id` field with 400 "missing library_id" before the
-            # handler gets a chance to ignore the value in favor of the path
-            # parameter. Send it anyway; the server discards it.
+            # The library is already identified by the path segment. The
+            # server's multipart parser now rejects any field outside its
+            # allow-list with 400 "unknown multipart field", so a redundant
+            # `library_id` field makes every upload fail. It is deliberately
+            # not sent: the path parameter is the single source of truth.
             data: dict[str, Any] = {
-                "library_id": str(library_id),
                 "external_key": external_key,
             }
             if title:

@@ -523,11 +523,11 @@ async def test_create_document_json_path_sends_camel_case_body() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_document_multipart_path_includes_library_id_field() -> None:
-    """The server's multipart parser requires a `library_id` form field even
-    though this endpoint is already scoped by the path segment -- omitting
-    it 400s with "missing library_id" before the handler gets a chance to
-    ignore the value. Regression test for that landed-API quirk."""
+async def test_create_document_multipart_omits_redundant_library_id_field() -> None:
+    """The library is identified by the path segment. IronRAG's multipart
+    parser rejects anything outside its allow-list with 400 "unknown
+    multipart field", so sending a redundant `library_id` form field makes
+    every upload fail. Regression test for that contract."""
     bodies: list[bytes] = []
 
     def handle(request: httpx.Request) -> httpx.Response:
@@ -560,8 +560,7 @@ async def test_create_document_multipart_path_includes_library_id_field() -> Non
     await client.aclose()
 
     body = bodies[0]
-    assert b'name="library_id"' in body
-    assert str(LIB).encode() in body
+    assert b'name="library_id"' not in body
     assert b'name="parent_external_key"' in body
     assert b"source:page:1" in body
 
