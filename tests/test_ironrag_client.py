@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from uuid import UUID
 
 import httpx
@@ -79,26 +80,36 @@ async def test_resolve_library_refs_uses_permission_filtered_catalog_snapshot() 
         if request.url.path == f"/v1/catalog/workspaces/{WS}/libraries":
             return httpx.Response(
                 200,
-                json=[
-                    {
-                        "id": str(LIB),
-                        "workspaceId": str(WS),
-                        "slug": "product-docs",
-                        "displayName": "Product documentation",
-                    }
-                ],
+                json={
+                    "items": [
+                        {
+                            "id": str(LIB),
+                            "workspaceId": str(WS),
+                            "slug": "product-docs",
+                            "displayName": "Product documentation",
+                        }
+                    ],
+                    "totalCount": 1,
+                    "offset": 0,
+                    "limit": 100,
+                },
             )
         if request.url.path == f"/v1/catalog/workspaces/{WS_2}/libraries":
             return httpx.Response(
                 200,
-                json=[
-                    {
-                        "id": str(LIB_2),
-                        "workspaceId": str(WS_2),
-                        "slug": "archive",
-                        "displayName": "Archive",
-                    }
-                ],
+                json={
+                    "items": [
+                        {
+                            "id": str(LIB_2),
+                            "workspaceId": str(WS_2),
+                            "slug": "archive",
+                            "displayName": "Archive",
+                        }
+                    ],
+                    "totalCount": 1,
+                    "offset": 0,
+                    "limit": 100,
+                },
             )
         raise AssertionError(f"unexpected request: {request.url}")
 
@@ -139,13 +150,18 @@ async def test_resolve_library_refs_rejects_catalog_workspace_mismatch() -> None
             return httpx.Response(200, json=[{"id": str(WS), "slug": "main"}])
         return httpx.Response(
             200,
-            json=[
-                {
-                    "id": str(LIB),
-                    "workspaceId": str(WS_2),
-                    "slug": "product-docs",
-                }
-            ],
+            json={
+                "items": [
+                    {
+                        "id": str(LIB),
+                        "workspaceId": str(WS_2),
+                        "slug": "product-docs",
+                    }
+                ],
+                "totalCount": 1,
+                "offset": 0,
+                "limit": 100,
+            },
         )
 
     client = _client(httpx.MockTransport(handle))
@@ -179,6 +195,175 @@ async def test_resolve_library_refs_rejects_ambiguous_catalog_snapshot() -> None
     client = _client(httpx.MockTransport(handle))
     with pytest.raises(IronRagCatalogError, match="duplicate workspace slug 'main'"):
         await client.resolve_library_refs({"main/product-docs"})
+    await client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# resolve_library_refs -- the two catalog list endpoints have DIFFERENT
+# response shapes. `/v1/catalog/workspaces` returns a bare array;
+# `/v1/catalog/workspaces/{id}/libraries` returns a bounded
+# `{items, totalCount, offset, limit}` page. The fake below mirrors the real
+# library endpoint: substring `search` over slug OR displayName, `limit`
+# clamped to 100, `totalCount` scoped to the search filter.
+# ---------------------------------------------------------------------------
+
+CATALOG_SERVER_DEFAULT_PAGE_LIMIT = 50
+CATALOG_SERVER_MAX_PAGE_LIMIT = 100
+
+
+def _workspaces_response() -> httpx.Response:
+    return httpx.Response(200, json=[{"id": str(WS), "slug": "main", "displayName": "Main"}])
+
+
+def _library_row(library_id: UUID, slug: str, display_name: str) -> dict[str, str]:
+    return {
+        "id": str(library_id),
+        "workspaceId": str(WS),
+        "slug": slug,
+        "displayName": display_name,
+    }
+
+
+def _library_page(
+    rows: Sequence[Mapping[str, str]],
+    request: httpx.Request,
+) -> httpx.Response:
+    """Serve one page the way the real library endpoint does."""
+    search = request.url.params.get("search")
+    needle = search.lower() if search else None
+    matches = [
+        row
+        for row in rows
+        if needle is None or needle in row["slug"].lower() or needle in row["displayName"].lower()
+    ]
+    offset = int(request.url.params.get("offset", 0))
+    requested = int(request.url.params.get("limit", CATALOG_SERVER_DEFAULT_PAGE_LIMIT))
+    limit = min(requested, CATALOG_SERVER_MAX_PAGE_LIMIT)
+    return httpx.Response(
+        200,
+        json={
+            "items": list(matches[offset : offset + limit]),
+            "totalCount": len(matches),
+            "offset": offset,
+            "limit": limit,
+        },
+    )
+
+
+def _crowded_rows(*, include_exact: bool) -> list[dict[str, str]]:
+    """250 substring decoys, one display-name-only decoy, optionally the target.
+
+    Every row matches `search=alpha`, so the narrowed result is still far
+    wider than a single page and the exact slug sits at the very end.
+    """
+    rows = [
+        _library_row(UUID(int=0x1000 + index), f"alpha-{index:03d}", f"Alpha decoy {index}")
+        for index in range(1, 251)
+    ]
+    rows.append(_library_row(UUID(int=0x2000), "beta-suite", "Alpha Suite"))
+    if include_exact:
+        rows.append(_library_row(LIB, "alpha", "Alpha"))
+    return rows
+
+
+@pytest.mark.asyncio
+async def test_resolve_library_refs_reads_the_library_page_envelope() -> None:
+    rows = [_library_row(LIB, "product-docs", "Product documentation")]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/catalog/workspaces":
+            return _workspaces_response()
+        assert request.url.path == f"/v1/catalog/workspaces/{WS}/libraries"
+        return _library_page(rows, request)
+
+    client = _client(httpx.MockTransport(handle))
+    targets = await client.resolve_library_refs({"main/product-docs"})
+    await client.aclose()
+
+    assert targets["main/product-docs"].workspace_id == WS
+    assert targets["main/product-docs"].library_id == LIB
+
+
+@pytest.mark.asyncio
+async def test_resolve_library_refs_walks_library_pages_past_the_first() -> None:
+    rows = _crowded_rows(include_exact=True)
+    library_requests: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/catalog/workspaces":
+            return _workspaces_response()
+        library_requests.append(request)
+        return _library_page(rows, request)
+
+    client = _client(httpx.MockTransport(handle))
+    targets = await client.resolve_library_refs({"main/alpha"})
+    await client.aclose()
+
+    # The exact slug is the last of 252 matching rows: a single-page read
+    # cannot see it, and a "first matching row wins" read picks a decoy.
+    assert targets["main/alpha"].library_id == LIB
+    assert targets["main/alpha"].workspace_id == WS
+    assert len(library_requests) >= 2
+
+
+@pytest.mark.asyncio
+async def test_resolve_library_refs_reports_scan_counts_for_a_missing_ref() -> None:
+    rows = _crowded_rows(include_exact=False)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/catalog/workspaces":
+            return _workspaces_response()
+        return _library_page(rows, request)
+
+    client = _client(httpx.MockTransport(handle))
+    with pytest.raises(IronRagCatalogError) as excinfo:
+        await client.resolve_library_refs({"main/alpha"})
+    await client.aclose()
+
+    message = str(excinfo.value)
+    assert "main/alpha" in message
+    assert "scanned 251 of 251" in message
+
+
+@pytest.mark.asyncio
+async def test_resolve_library_refs_rejects_a_truncated_library_page_walk() -> None:
+    """A server that promises more rows than it serves must fail loudly."""
+    served = _crowded_rows(include_exact=False)[:100]
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/catalog/workspaces":
+            return _workspaces_response()
+        offset = int(request.url.params.get("offset", 0))
+        return httpx.Response(
+            200,
+            json={
+                "items": served if offset == 0 else [],
+                "totalCount": 2500,
+                "offset": offset,
+                "limit": 100,
+            },
+        )
+
+    client = _client(httpx.MockTransport(handle))
+    with pytest.raises(IronRagCatalogError) as excinfo:
+        await client.resolve_library_refs({"main/alpha"})
+    await client.aclose()
+
+    message = str(excinfo.value)
+    assert "incomplete" in message
+    assert "scanned 100 of 2500" in message
+
+
+@pytest.mark.asyncio
+async def test_resolve_library_refs_rejects_a_library_response_without_a_page() -> None:
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/catalog/workspaces":
+            return _workspaces_response()
+        return httpx.Response(200, json={"totalCount": 1})
+
+    client = _client(httpx.MockTransport(handle))
+    with pytest.raises(IronRagCatalogError, match="items"):
+        await client.resolve_library_refs({"main/alpha"})
     await client.aclose()
 
 

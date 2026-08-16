@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.2 — 2026-08-16
+
+- **Fix:** the catalog client could not read the library list at all. The two
+  catalog list endpoints have different response shapes — `GET
+  /v1/catalog/workspaces` returns a bare JSON array, while `GET
+  /v1/catalog/workspaces/{workspaceId}/libraries` returns a bounded
+  `{items, totalCount, offset, limit}` page — and a single reader demanded an
+  array from both. Startup therefore failed with "must return a JSON array of
+  objects" before any routing ref could be resolved, so a connector pointed at
+  a workspace never came up. Each endpoint now has its own reader, chosen
+  explicitly per call site rather than inferred from the payload.
+- **Fix:** library ref resolution now walks the whole result instead of reading
+  one page. The library endpoint is paginated and clamps `limit`, so in a
+  workspace with more libraries than fit on a page a perfectly healthy ref was
+  reported as not visible. Resolution narrows server-side with `search`, then
+  compares slugs exactly — `search` is a case-insensitive substring filter, so
+  a neighbouring slug must never win — and keeps requesting pages until
+  `totalCount` is accounted for. A short page no longer ends the walk.
+- **Fix:** incompleteness is now an error instead of a silent miss. If the
+  server stops returning new rows while still claiming more, resolution fails
+  with the counts rather than downgrading to "not visible", and a malformed
+  page is rejected instead of being defaulted to an empty one.
+- **Diagnostics:** the "library ref is not visible" error now names how many
+  catalog rows were scanned, how many the server reported for that search, and
+  which workspace was searched, so an unresolvable ref can be told apart from
+  an incomplete scan without reproducing the run.
+
 ## 0.2.1 — 2026-07-29
 
 - **Fix:** stop sending the redundant `library_id` multipart field when

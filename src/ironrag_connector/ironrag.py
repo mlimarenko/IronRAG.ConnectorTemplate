@@ -6,7 +6,12 @@ Endpoints
 * ``GET /v1/catalog/workspaces`` and
   ``GET /v1/catalog/workspaces/{id}/libraries`` — resolve canonical
   ``workspace-slug/library-slug`` routing refs once per routing snapshot.
-  Unaffected by the content-domain redesign.
+  The two have **different response shapes**, and each has its own reader
+  here rather than one shape-sniffing helper: workspaces come back as a
+  bare JSON array, while libraries come back as a bounded
+  ``{items, totalCount, offset, limit}`` page with ``search``/``offset``/
+  ``limit`` query parameters. A library ref is therefore resolved by
+  walking that page to exhaustion, never by reading the first page.
 * ``GET /v1/content/libraries/{libraryId}/documents`` — the single
   read-collection interface: cursor pagination, ``search`` (a
   case-insensitive substring/ILIKE filter on ``external_key`` only --
@@ -49,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal, Protocol
@@ -74,10 +80,30 @@ confirm this default against each source system's documented rate limit
 before the first production re-walk (plan S7.6/S9 step 2).
 """
 
+CATALOG_LIBRARY_PAGE_LIMIT = 100
+"""Page size requested when walking the catalog library collection.
+
+The endpoint clamps ``limit`` to its own maximum, so a page may come back
+shorter than this without meaning the collection is exhausted -- only
+``totalCount`` decides that.
+"""
+
 
 # ---------------------------------------------------------------------------
 # Typed response models
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _CatalogPage:
+    """One ``{items, totalCount, offset, limit}`` catalog page.
+
+    ``total_count`` is scoped to the request's filters, not to the whole
+    collection -- a searched page reports how many rows matched the search.
+    """
+
+    items: tuple[Mapping[str, Any], ...]
+    total_count: int
 
 
 class DocumentResource(BaseModel):
@@ -388,7 +414,7 @@ class IronRagClient:
         if not normalized_refs:
             return {}
 
-        workspaces_payload = await self._catalog_list(
+        workspaces_payload = await self._catalog_array(
             "/v1/catalog/workspaces",
             resource="workspaces",
         )
@@ -409,17 +435,15 @@ class IronRagClient:
                     f"for library ref(s): {refs}"
                 )
             workspace_id = _catalog_uuid(workspace, "id", "workspace", workspace_slug)
-            libraries_payload = await self._catalog_list(
-                f"/v1/catalog/workspaces/{workspace_id}/libraries",
-                resource=f"libraries in workspace '{workspace_slug}'",
-            )
-            libraries = _index_catalog_rows(libraries_payload, resource="library")
 
             for library_ref in sorted(refs_by_workspace[workspace_slug]):
                 _, library_slug = library_ref.split("/", 1)
-                library = libraries.get(library_slug)
-                if library is None:
-                    raise IronRagCatalogError(f"IronRAG library ref '{library_ref}' is not visible")
+                library = await self._find_library_row(
+                    workspace_id=workspace_id,
+                    workspace_slug=workspace_slug,
+                    library_slug=library_slug,
+                    library_ref=library_ref,
+                )
                 row_workspace_id = _catalog_uuid(
                     library,
                     "workspaceId",
@@ -438,26 +462,137 @@ class IronRagClient:
                 )
         return result
 
-    async def _catalog_list(
+    async def _find_library_row(
+        self,
+        *,
+        workspace_id: UUID,
+        workspace_slug: str,
+        library_slug: str,
+        library_ref: str,
+    ) -> Mapping[str, Any]:
+        """Resolve one library slug through the paginated catalog page.
+
+        The endpoint's ``search`` filter is a case-insensitive substring
+        match over ``slug`` and ``displayName``, so searching for the exact
+        slug is guaranteed to include the wanted row if it is visible -- but
+        it also returns every row that merely contains the slug, and it
+        returns them a bounded page at a time. Both facts are load-bearing:
+        the exact-slug comparison below rejects the substring neighbours, and
+        the walk keeps requesting pages until the whole filtered result has
+        been seen. A workspace with thousands of libraries would otherwise
+        report a perfectly healthy ref as invisible.
+
+        The walk stops only on ``totalCount``, never on a short page: the
+        server clamps ``limit``, so "fewer rows than requested" says nothing
+        about exhaustion. If the server stops handing out new rows while it
+        still claims more, that is raised with the counts rather than
+        silently downgraded to "not visible".
+        """
+        path = f"/v1/catalog/workspaces/{workspace_id}/libraries"
+        resource = f"libraries in workspace '{workspace_slug}'"
+        seen_ids: set[str] = set()
+        received = 0
+        total = 0
+        while True:
+            page = await self._catalog_page(
+                path,
+                resource=resource,
+                params={
+                    "search": library_slug,
+                    "offset": received,
+                    "limit": CATALOG_LIBRARY_PAGE_LIMIT,
+                },
+            )
+            total = page.total_count
+            for row in page.items:
+                if row.get("slug") == library_slug:
+                    return row
+            received += len(page.items)
+            if received >= total:
+                break
+            # Count distinct rows so a server that ignores `offset` cannot
+            # inflate the reported figure, and stop as soon as a page adds
+            # nothing new -- completeness is no longer reachable by asking.
+            before = len(seen_ids)
+            seen_ids.update(str(row.get("id")) for row in page.items)
+            if len(seen_ids) == before:
+                raise IronRagCatalogError(
+                    f"IronRAG catalog {resource} returned an incomplete page walk for "
+                    f"'{library_slug}': scanned {len(seen_ids)} of {total} matching rows "
+                    f"before the server stopped returning new rows"
+                )
+        raise IronRagCatalogError(
+            f"IronRAG library ref '{library_ref}' is not visible "
+            f"(scanned {received} of {total} catalog rows matching '{library_slug}' "
+            f"in workspace '{workspace_slug}')"
+        )
+
+    async def _catalog_array(
         self,
         path: str,
         *,
         resource: str,
     ) -> list[Mapping[str, Any]]:
-        response = await self._client.get(path)
-        if response.status_code >= 400:
-            raise IronRagCatalogError(
-                f"IronRAG catalog {resource} -> {response.status_code}: {response.text[:400]}"
-            )
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise IronRagCatalogError(f"IronRAG catalog {resource} returned invalid JSON") from exc
+        """Read a catalog endpoint whose response is a bare JSON array.
+
+        ``GET /v1/catalog/workspaces`` is unpaginated and returns the visible
+        workspaces directly. Do not point this at a paginated endpoint --
+        the page shape has its own reader below.
+        """
+        payload = await self._catalog_payload(path, resource=resource)
         if not isinstance(payload, list) or not all(isinstance(item, Mapping) for item in payload):
             raise IronRagCatalogError(
                 f"IronRAG catalog {resource} must return a JSON array of objects"
             )
         return payload
+
+    async def _catalog_page(
+        self,
+        path: str,
+        *,
+        resource: str,
+        params: Mapping[str, Any],
+    ) -> _CatalogPage:
+        """Read a catalog endpoint whose response is a bounded page envelope.
+
+        ``GET /v1/catalog/workspaces/{workspaceId}/libraries`` answers with
+        ``{items, totalCount, offset, limit}``. Every field is validated
+        rather than defaulted: a missing ``items`` defaulted to ``[]`` or a
+        non-numeric ``totalCount`` coerced to ``0`` would turn a malformed
+        response into a confident "not visible".
+        """
+        payload = await self._catalog_payload(path, resource=resource, params=params)
+        if not isinstance(payload, Mapping):
+            raise IronRagCatalogError(f"IronRAG catalog {resource} must return a JSON page object")
+        items = payload.get("items")
+        if not isinstance(items, list) or not all(isinstance(item, Mapping) for item in items):
+            raise IronRagCatalogError(
+                f"IronRAG catalog {resource} page must carry an 'items' array of objects"
+            )
+        total_count = payload.get("totalCount")
+        if not isinstance(total_count, int) or isinstance(total_count, bool) or total_count < 0:
+            raise IronRagCatalogError(
+                f"IronRAG catalog {resource} page must carry a "
+                "non-negative integer 'totalCount'"
+            )
+        return _CatalogPage(items=tuple(items), total_count=total_count)
+
+    async def _catalog_payload(
+        self,
+        path: str,
+        *,
+        resource: str,
+        params: Mapping[str, Any] | None = None,
+    ) -> Any:
+        response = await self._client.get(path, params=dict(params) if params else None)
+        if response.status_code >= 400:
+            raise IronRagCatalogError(
+                f"IronRAG catalog {resource} -> {response.status_code}: {response.text[:400]}"
+            )
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise IronRagCatalogError(f"IronRAG catalog {resource} returned invalid JSON") from exc
 
     # -- documents -----------------------------------------------------------
 

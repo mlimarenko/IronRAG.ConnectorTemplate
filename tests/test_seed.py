@@ -52,15 +52,23 @@ rules:
         json=[{"id": str(WS), "slug": "main", "displayName": "Main"}],
     )
     httpx_mock.add_response(
-        url=f"http://ironrag.example.com/v1/catalog/workspaces/{WS}/libraries",
-        json=[
-            {
-                "id": str(LIB),
-                "workspaceId": str(WS),
-                "slug": "knowledge-base",
-                "displayName": "Knowledge base",
-            }
-        ],
+        url=(
+            f"http://ironrag.example.com/v1/catalog/workspaces/{WS}/libraries"
+            "?search=knowledge-base&offset=0&limit=100"
+        ),
+        json={
+            "items": [
+                {
+                    "id": str(LIB),
+                    "workspaceId": str(WS),
+                    "slug": "knowledge-base",
+                    "displayName": "Knowledge base",
+                }
+            ],
+            "totalCount": 1,
+            "offset": 0,
+            "limit": 100,
+        },
     )
     httpx_mock.add_response(
         url=f"http://ironrag.example.com/v1/content/libraries/{LIB}/documents?limit=200",
